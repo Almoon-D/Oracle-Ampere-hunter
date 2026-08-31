@@ -33,7 +33,7 @@ jobs:
           region=${{ secrets.OCI_REGION }}
           key_file=$HOME/.oci/oci_api_key.pem
           EOF
-          chmod 600 "$HOME/.oci/config
+          chmod 600 "$HOME/.oci/config"
 
       - name: Fetch Availability Domain & Ubuntu ARM Image
         id: fetch-resources
