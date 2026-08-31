@@ -106,16 +106,7 @@ for r in json.loads(sys.stdin.read().strip() or "[]") or []:
     print(f"  - {r.get(\"n\")}: {r.get(\"s\")} ({r.get(\"o\")} OCPU)")
 ' 2>/dev/null
 
-REMAINING=$(( TARGET_OCPUS - USED ))
-log "$SHAPE OCPUs already allocated: $USED of $TARGET_OCPUS (remaining: $REMAINING)."
-
-if [ "$REMAINING" -le 0 ]; then
-  log "Free-tier A1 allowance is already fully used. Nothing to hunt."
-  summary "### Ampere A1 hunt — nothing to do"
-  summary "All $TARGET_OCPUS free-tier OCPUs are already allocated. Launching more would be billable, so this run stopped."
-  emit "result=already-satisfied"
-  exit 0
-fi
+log "$SHAPE OCPUs already allocated: $USED."
 
 # Service limits. Asking for more than the tenancy is allowed comes back as
 # LimitExceeded, so read the limits and shrink the request to fit rather than
@@ -140,23 +131,39 @@ else
   CORE_LIMIT=""; MEM_LIMIT=""
 fi
 
+# The tenancy's total A1 allowance is the smallest of what the free tier gives,
+# what the core limit allows, and what the memory limit allows at the fixed
+# GB-per-OCPU ratio. These limits are totals for the tenancy, so what is left to
+# hunt for is that total minus what is already running -- clamping the remainder
+# to a total would ask for a second full allowance once the first one landed.
+ALLOWANCE=$TARGET_OCPUS
 if [ -n "$CORE_LIMIT" ] && [ -n "$MEM_LIMIT" ]; then
   log "Tenancy A1 service limits: ${CORE_LIMIT} OCPU / ${MEM_LIMIT} GB."
-  if [ "$CORE_LIMIT" -eq 0 ] || [ "$MEM_LIMIT" -eq 0 ]; then
+  MEM_CAP=$(( MEM_LIMIT / GB_PER_OCPU ))
+  [ "$CORE_LIMIT" -lt "$ALLOWANCE" ] && ALLOWANCE=$CORE_LIMIT
+  [ "$MEM_CAP" -lt "$ALLOWANCE" ] && ALLOWANCE=$MEM_CAP
+  if [ "$ALLOWANCE" -le 0 ]; then
     summary "### Ampere A1 hunt stopped — no A1 quota"
     summary "This tenancy's A1 service limit is ${CORE_LIMIT} OCPU / ${MEM_LIMIT} GB, so no A1 instance of any size can be launched."
     summary "Raise it under Governance & Administration -> Limits, Quotas and Usage -> Compute -> standard-a1-core-count (Request a service limit increase)."
     fail "This tenancy is allowed 0 A1 capacity (limits: ${CORE_LIMIT} OCPU / ${MEM_LIMIT} GB). Request a service limit increase before hunting."
   fi
-  MEM_CAP=$(( MEM_LIMIT / GB_PER_OCPU ))
-  [ "$CORE_LIMIT" -lt "$REMAINING" ] && REMAINING=$CORE_LIMIT
-  [ "$MEM_CAP" -lt "$REMAINING" ] && REMAINING=$MEM_CAP
-  log "Largest size the limits and free allowance permit: ${REMAINING} OCPU."
 else
-  log "Could not read the A1 service limits; keeping the full ladder."
+  log "Could not read the A1 service limits; assuming the free-tier $TARGET_OCPUS OCPU."
 fi
 
-# Only ladder rungs that still fit in the remaining free allowance.
+REMAINING=$(( ALLOWANCE - USED ))
+log "Allowance ${ALLOWANCE} OCPU, ${USED} already allocated, ${REMAINING} left to hunt for."
+
+if [ "$REMAINING" -le 0 ]; then
+  log "The whole A1 allowance is already allocated. Nothing to hunt."
+  summary "### Ampere A1 hunt — nothing to do"
+  summary "All ${ALLOWANCE} allowed A1 OCPUs are already allocated, so this run stopped without launching."
+  emit "result=already-satisfied"
+  exit 0
+fi
+
+# Only ladder rungs that still fit in the remaining allowance.
 LADDER=()
 for n in $OCPU_LADDER; do
   [ "$n" -le "$REMAINING" ] && LADDER+=("$n")

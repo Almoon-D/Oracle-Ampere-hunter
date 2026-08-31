@@ -53,7 +53,7 @@ fi
 
 # --- 2. Partial usage narrows the ladder to what still fits ---------------
 run_hunt partial MOCK_EXISTING='[{"n":"a","s":"RUNNING","o":2.0}]' MOCK_SUCCEED_ON=999
-if grep -q 'remaining: 2' <<< "$LOG" && grep -q 'Sizes to try: 2 1 OCPU' <<< "$LOG" \
+if grep -q '4 OCPU, 2 already allocated, 2 left' <<< "$LOG" && grep -q 'Sizes to try: 2 1 OCPU' <<< "$LOG" \
    && [ -s "$TMP/partial/state/launches" ] \
    && ! grep -q '"ocpus": 4' "$TMP/partial/state/launches"; then
   ok "with 2 of 4 OCPUs used, never asks for more than the remaining 2"
@@ -147,6 +147,32 @@ if [ "$RC" -ne 0 ] && grep -q 'allowed 0 A1 capacity' <<< "$LOG" \
   ok "refuses to launch at all when the tenancy A1 limit is zero"
 else
   bad "refuses to launch at all when the tenancy A1 limit is zero" "$LOG"
+fi
+
+# --- 8f. A tenancy capped at 2 OCPU that already runs 2 is done ----------
+# The real tenancy is limited to 2 OCPU / 12 GB. Clamping the *remainder* to
+# that total would ask for 2 more once the first 2 landed, taking the tenancy
+# to 4 against a limit of 2 and failing the run red forever after.
+run_hunt capped_satisfied MOCK_CORE_LIMIT=2 MOCK_MEM_LIMIT=12 \
+  MOCK_EXISTING='[{"n":"a","s":"RUNNING","o":2.0}]'
+if [ "$RC" -eq 0 ] && grep -q 'result=already-satisfied' <<< "$OUT" \
+   && [ ! -f "$TMP/capped_satisfied/state/launches" ]; then
+  ok "a 2 OCPU tenancy already running 2 OCPU stops instead of over-launching"
+else
+  bad "a 2 OCPU tenancy already running 2 OCPU stops instead of over-launching" "$OUT
+$LOG"
+fi
+
+# --- 8g. Same tenancy with 1 of 2 used tops up by exactly 1 --------------
+run_hunt capped_topup MOCK_SUCCEED_ON=999 MOCK_CORE_LIMIT=2 MOCK_MEM_LIMIT=12 \
+  MOCK_EXISTING='[{"n":"a","s":"RUNNING","o":1.0}]'
+if grep -q 'Allowance 2 OCPU, 1 already allocated, 1 left' <<< "$LOG" \
+   && grep -q 'Sizes to try: 1 OCPU' <<< "$LOG" \
+   && [ -s "$TMP/capped_topup/state/launches" ] \
+   && ! grep -qE '"ocpus": [234]' "$TMP/capped_topup/state/launches"; then
+  ok "a 2 OCPU tenancy already running 1 OCPU asks for exactly 1 more"
+else
+  bad "a 2 OCPU tenancy already running 1 OCPU asks for exactly 1 more" "$LOG"
 fi
 
 # --- 8e. Limits clamp the ladder before the first attempt ----------------
