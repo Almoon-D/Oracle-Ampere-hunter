@@ -188,11 +188,33 @@ fi
 # --- 9. Throttling backs off instead of hammering -------------------------
 run_hunt throttle MOCK_SUCCEED_ON=999 HUNT_SECONDS=10 INTERVAL=1 JITTER=0 \
   MOCK_LAUNCH_ERROR='ServiceError: {"code": "TooManyRequests", "message": "Too many requests for the user", "status": 429}'
-if [ "$RC" -eq 0 ] && grep -q 'Rate-limited by OCI. Backing off 2s' <<< "$LOG" \
-   && grep -q 'Backing off 4s' <<< "$LOG"; then
+if [ "$RC" -eq 0 ] && grep -q 'Slowing to 2s between attempts' <<< "$LOG" \
+   && grep -q 'Slowing to 4s' <<< "$LOG"; then
   ok "backs off exponentially when OCI returns 429"
 else
   bad "backs off exponentially when OCI returns 429" "$LOG"
+fi
+
+# --- 9b. A capacity miss must not throw away the learned pace -------------
+# The live run went clean/429/429/clean/429/429 because the pace reset to the
+# floor on every clean answer and instantly earned the next throttle.
+run_hunt pace MOCK_SUCCEED_ON=999 MOCK_THROTTLE_ON='1 2' HUNT_SECONDS=40 INTERVAL=4 JITTER=0
+if grep -q 'Slowing to 8s' <<< "$LOG" && grep -q 'Slowing to 16s' <<< "$LOG" \
+   && grep -q 'Next attempt in 12s' <<< "$LOG" \
+   && ! grep -q 'Next attempt in 4s' <<< "$LOG"; then
+  ok "eases the pace down after a throttle instead of resetting to the floor"
+else
+  bad "eases the pace down after a throttle instead of resetting to the floor" "$LOG"
+fi
+
+# --- 9c. The summary calls out a window lost to throttling ----------------
+run_hunt throttle_report MOCK_SUCCEED_ON=999 MOCK_THROTTLE_ON='1 2 3' \
+  HUNT_SECONDS=25 INTERVAL=2 JITTER=0
+if grep -q 'were rate-limited' "$TMP/throttle_report/summary" \
+   && grep -q 'More attempts were throttled than answered' "$TMP/throttle_report/summary"; then
+  ok "reports throttling in the summary when it dominates the window"
+else
+  bad "reports throttling in the summary when it dominates the window" "$(cat "$TMP/throttle_report/summary" 2>/dev/null)"
 fi
 
 # --- 10. A missing image is caught before the loop ------------------------

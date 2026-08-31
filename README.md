@@ -98,16 +98,20 @@ Set these as `env:` on the *Hunt* step:
 | `GB_PER_OCPU` | `6` | Fixed by the free tier |
 | `BOOT_VOLUME_GB` | `50` | Free tier gives 200 GB total block storage |
 | `OS_NAME` / `OS_VERSION` | `Canonical Ubuntu` / `24.04` | Image to launch |
-| `INTERVAL` | `20` | Base seconds between attempts |
+| `INTERVAL` | `45` | Floor for seconds between attempts; the pace adapts upward from here |
 | `JITTER` | `5` | Random 0–4s added, so parallel hunters desynchronise |
 
-`INTERVAL` is the knob to be careful with. Attempts faster than ~15s get you
-`TooManyRequests`, and time spent backing off is time not spent hunting.
+`INTERVAL` is only a floor. The hunt doubles its pace on every `TooManyRequests`
+and eases it back by a quarter on every clean answer, so it converges on the
+rate the tenancy actually tolerates rather than a guess. A live 10-minute run at
+a 20s floor spent two thirds of the window throttled, which is what set the
+default to 45s. The end-of-run summary reports capacity misses against
+throttles; if throttles dominate, raise the floor.
 
 ## Tests
 
 ```
-bash tests/test_hunt.sh      # 15 cases against tests/mock_oci.sh, no tenancy needed
+bash tests/test_hunt.sh      # 19 cases against tests/mock_oci.sh, no tenancy needed
 shellcheck -x scripts/*.sh tests/*.sh
 actionlint                   # workflow syntax; plain YAML parsing misses this
 ```

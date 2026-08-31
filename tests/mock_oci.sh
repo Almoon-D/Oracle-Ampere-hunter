@@ -52,6 +52,14 @@ case "$ARGS" in
         exit 1
       fi
     fi
+    # Throttle a chosen set of attempt numbers, so a run can interleave 429s
+    # with capacity misses the way the live tenancy does.
+    case " ${MOCK_THROTTLE_ON:-} " in
+      *" $n "*)
+        echo 'ServiceError: {"code": "TooManyRequests", "message": "Too many requests for the user", "status": 429}' >&2
+        exit 1 ;;
+    esac
+
     if [ -n "${MOCK_SUCCEED_ON:-}" ] && [ "$n" -ge "$MOCK_SUCCEED_ON" ]; then
       echo '{"data": {"id": "ocid1.instance.oc1.eu-madrid-1.WON", "lifecycle-state": "PROVISIONING"}}'
       exit 0

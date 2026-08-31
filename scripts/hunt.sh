@@ -18,7 +18,7 @@ OS_NAME="${OS_NAME:-Canonical Ubuntu}"
 OS_VERSION="${OS_VERSION:-24.04}"
 SSH_KEY_FILE="${SSH_KEY_FILE:-ssh_key.pub}"
 HUNT_SECONDS="${HUNT_SECONDS:-240}"
-INTERVAL="${INTERVAL:-20}"               # base seconds between launch attempts
+INTERVAL="${INTERVAL:-45}"               # floor for seconds between launch attempts
 JITTER="${JITTER:-5}"                    # random 0..JITTER-1s added to each wait
 MAX_UNKNOWN="${MAX_UNKNOWN:-5}"
 
@@ -74,6 +74,13 @@ classify() {
       echo transient ;;
     *) echo unknown ;;
   esac
+}
+
+# Ease the pace back toward the floor by a quarter at a time.
+ease_pace() {
+  PACE=$(( PACE * 3 / 4 ))
+  [ "$PACE" -lt "$INTERVAL" ] && PACE=$INTERVAL
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -241,10 +248,15 @@ fi
 DEADLINE=$(( SECONDS + HUNT_SECONDS ))
 ATTEMPT=0
 UNKNOWN_STREAK=0
-BACKOFF="$INTERVAL"
+MISSES=0
+THROTTLES=0
+# How fast the tenancy actually tolerates being asked. It rises on a 429 and
+# eases back down on a clean answer, converging on the sustainable rate instead
+# of being guessed up front.
+PACE="$INTERVAL"
 declare -A SEEN_ERRORS=()
 
-log "Hunting for ${HUNT_SECONDS}s, one attempt every ~${INTERVAL}s."
+log "Hunting for ${HUNT_SECONDS}s, starting at one attempt every ${INTERVAL}s."
 
 while [ "$SECONDS" -lt "$DEADLINE" ]; do
   IFS='|' read -r ocpus ad fd <<< "${ATTEMPTS[$(( ATTEMPT % ${#ATTEMPTS[@]} ))]}"
@@ -313,15 +325,17 @@ while [ "$SECONDS" -lt "$DEADLINE" ]; do
 
   case "$KIND" in
     capacity)
-      log "No capacity here. Rotating placement."
-      BACKOFF="$INTERVAL"
+      MISSES=$(( MISSES + 1 ))
+      ease_pace
+      log "No capacity here. Rotating placement. Next attempt in ${PACE}s."
       ;;
     throttled)
-      BACKOFF=$(( BACKOFF * 2 )); [ "$BACKOFF" -gt 300 ] && BACKOFF=300
-      log "Rate-limited by OCI. Backing off ${BACKOFF}s."
+      THROTTLES=$(( THROTTLES + 1 ))
+      PACE=$(( PACE * 2 )); [ "$PACE" -gt 300 ] && PACE=300
+      log "Rate-limited by OCI. Slowing to ${PACE}s between attempts."
       ;;
     transient)
-      BACKOFF=$(( INTERVAL * 2 ))
+      ease_pace
       log "Transient OCI error, retrying: $FIRST_LINE"
       ;;
     quota)
@@ -344,7 +358,6 @@ while [ "$SECONDS" -lt "$DEADLINE" ]; do
       LADDER=("${NEW_LADDER[@]}")
       log "${ocpus} OCPU exceeds the A1 service limit. Dropping to sizes ${LADDER[*]} OCPU."
       build_attempts
-      BACKOFF=5
       ;;
     auth|badrequest)
       summary "### Ampere A1 hunt stopped — configuration error"
@@ -362,19 +375,23 @@ while [ "$SECONDS" -lt "$DEADLINE" ]; do
       if [ "$UNKNOWN_STREAK" -ge "$MAX_UNKNOWN" ]; then
         fail "$MAX_UNKNOWN consecutive unrecognised errors, last: $FIRST_LINE"
       fi
-      BACKOFF=$(( INTERVAL * 2 ))
+      ease_pace
       ;;
   esac
   [ "$KIND" = unknown ] || UNKNOWN_STREAK=0
 
   # Jitter, so a fleet of these does not hammer OCI on the same second.
-  SLEEP=$(( BACKOFF + (JITTER > 0 ? RANDOM % JITTER : 0) ))
+  SLEEP=$(( PACE + (JITTER > 0 ? RANDOM % JITTER : 0) ))
   [ $(( SECONDS + SLEEP )) -lt "$DEADLINE" ] || break
   sleep "$SLEEP"
 done
 
-log "Window closed after $ATTEMPT attempts without capacity. This is normal."
+log "Window closed after $ATTEMPT attempts ($MISSES capacity misses, $THROTTLES throttled). No capacity. This is normal."
 summary "### Ampere A1 hunt — no capacity this run"
-summary "$ATTEMPT attempts across ${#PLACEMENTS[@]} placement(s) and sizes ${LADDER[*]} OCPU. Will try again on the next run."
+summary "$ATTEMPT attempts across ${#PLACEMENTS[@]} placement(s) at sizes ${LADDER[*]} OCPU: $MISSES reached the capacity check, $THROTTLES were rate-limited."
+if [ "$THROTTLES" -gt "$MISSES" ]; then
+  summary ""
+  summary "More attempts were throttled than answered, so most of the window went to backing off. Raise \`INTERVAL\` (currently ${INTERVAL}s) to hunt at a rate this tenancy tolerates."
+fi
 emit "result=no-capacity"
 exit 0
