@@ -2,111 +2,110 @@ name: Hunt Oracle Ampere A1
 
 on:
   schedule:
+    # GitHub's shortest allowed interval. Scheduled runs on the shared pool are
+    # regularly delayed by 10-30 minutes, so treat this as "roughly every few
+    # minutes", not a guarantee. For a serious hunt, dispatch a long run.
     - cron: '*/5 * * * *'
   workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: 'Minutes to hunt in this run (max 330 - a job cannot exceed 6h).'
+        required: false
+        default: '4'
+      ocpu_ladder:
+        description: 'OCPU sizes to try at each placement, largest first.'
+        required: false
+        default: '4 2 1'
+      display_name:
+        description: 'Name for the instance if one is captured.'
+        required: false
+        default: 'ObliskIQ-lite'
+
+# Overlapping hunts would double the request rate and invite OCI throttling.
+concurrency:
+  group: ampere-hunt
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
 
 jobs:
-  launch-instance:
+  hunt:
     runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(github.event.inputs.duration_minutes || '4') + 6 }}
 
     steps:
-      - name: Setup OCI CLI & Config
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install OCI CLI
+        run: pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Configure and verify OCI credentials
         env:
-          OCI_KEY_RAW: ${{ secrets.OCI_API_KEY }}
-          OCI_USER: ${{ secrets.OCI_USER_OCID }}
-          OCI_FP: ${{ secrets.OCI_FINGERPRINT }}
-          OCI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
-          OCI_REG: ${{ secrets.OCI_REGION }}
-        run: |
-          pip install --no-cache-dir oci-cli
+          OCI_API_KEY: ${{ secrets.OCI_API_KEY }}
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+        run: ./scripts/oci-setup.sh
 
-          mkdir -p /home/runner/.oci
-
-          # 1. Limpiar la clave privada de caracteres Windows (\r)
-          echo "$OCI_KEY_RAW" | tr -d '\r' > /home/runner/.oci/oci_api_key.pem
-          chmod 600 /home/runner/.oci/oci_api_key.pem
-
-          # 2. Limpiar espacios y retornos en variables
-          USER_CLEAN=$(echo "$OCI_USER" | tr -d ' \r\n\t')
-          FP_CLEAN=$(echo "$OCI_FP" | tr -d ' \r\n\t')
-          TENANCY_CLEAN=$(echo "$OCI_TENANCY" | tr -d ' \r\n\t')
-          REGION_CLEAN=$(echo "$OCI_REG" | tr -d ' \r\n\t')
-
-          # 3. Generar config con valores limpios y ruta fija
-          cat <<EOF > /home/runner/.oci/config
-          [DEFAULT]
-          user=$USER_CLEAN
-          fingerprint=$FP_CLEAN
-          tenancy=$TENANCY_CLEAN
-          region=$REGION_CLEAN
-          key_file=/home/runner/.oci/oci_api_key.pem
-          EOF
-          chmod 600 /home/runner/.oci/config
-
-      - name: Fetch Availability Domain & Ubuntu ARM Image
-        id: fetch-resources
+      - name: Write SSH public key
         env:
-          COMPARTMENT_RAW: ${{ secrets.OCI_COMPARTMENT_OCID }}
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
-          COMPARTMENT_ID=$(echo "$COMPARTMENT_RAW" | tr -d ' \r\n\t')
-          echo "COMPARTMENT_ID=$COMPARTMENT_ID" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          [ -n "$SSH_PUBLIC_KEY" ] || { echo "::error::Secret SSH_PUBLIC_KEY is empty."; exit 1; }
+          printf '%s\n' "$SSH_PUBLIC_KEY" | tr -d '\r' > ssh_key.pub
 
-          AD=$(oci iam availability-domain list \
-            --compartment-id "$COMPARTMENT_ID" \
-            --query "data[0].name" --raw-output)
-          echo "AD=$AD" >> $GITHUB_OUTPUT
-
-          IMAGE_ID=$(oci compute image list \
-            --compartment-id "$COMPARTMENT_ID" \
-            --operating-system "Canonical Ubuntu" \
-            --shape "VM.Standard.A1.Flex" \
-            --sort-by TIMECREATED --sort-order DESC \
-            --query "data[?contains(\"operating-system-version\", '24.04') && contains(\"display-name\", 'aarch64')].id | [0]" \
-            --raw-output)
-          echo "IMAGE_ID=$IMAGE_ID" >> $GITHUB_OUTPUT
-
-      - name: Hunt Loop (Every 15 seconds)
+      - name: Hunt
+        id: hunt
         env:
-          SSH_KEY_RAW: ${{ secrets.SSH_PUBLIC_KEY }}
-          SUBNET_RAW: ${{ secrets.OCI_SUBNET_OCID }}
+          OCI_COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
+          OCI_SUBNET_OCID: ${{ secrets.OCI_SUBNET_OCID }}
+          OCPU_LADDER: ${{ github.event.inputs.ocpu_ladder || '4 2 1' }}
+          DISPLAY_NAME: ${{ github.event.inputs.display_name || 'ObliskIQ-lite' }}
+          DURATION_MINUTES: ${{ github.event.inputs.duration_minutes || '4' }}
         run: |
-          SUBNET_ID=$(echo "$SUBNET_RAW" | tr -d ' \r\n\t')
-          echo "$SSH_KEY_RAW" | tr -d '\r' > ssh_key.pub
+          set -euo pipefail
+          # A job is capped at 6h; leave room for setup and the wrap-up steps.
+          MINUTES=$DURATION_MINUTES
+          [ "$MINUTES" -gt 330 ] 2>/dev/null && MINUTES=330
+          export HUNT_SECONDS=$(( MINUTES * 60 ))
+          ./scripts/hunt.sh
 
-          END_TIME=$((SECONDS + 240))
-          ATTEMPT=1
-
-          while [ $SECONDS -lt $END_TIME ]; do
-            echo "--- Intento #$ATTEMPT ($(date +'%T')) ---"
-            
-            RESPONSE=$(oci compute instance launch \
-              --availability-domain "${{ steps.fetch-resources.outputs.AD }}" \
-              --compartment-id "${{ steps.fetch-resources.outputs.COMPARTMENT_ID }}" \
-              --shape "VM.Standard.A1.Flex" \
-              --shape-config '{"ocpus": 2, "memoryInGBs": 12}' \
-              --image-id "${{ steps.fetch-resources.outputs.IMAGE_ID }}" \
-              --subnet-id "$SUBNET_ID" \
-              --display-name "ObliskIQ lite" \
-              --assign-public-ip true \
-              --ssh-authorized-keys-file ssh_key.pub 2>&1) || STATUS=$?
-
-            if [ -z "$STATUS" ]; then
-              echo "¡ÉXITO! Instancia ObliskIQ lite creada correctamente."
-              echo "$RESPONSE"
-              exit 0
-            else
-              if echo "$RESPONSE" | grep -qi "Out of host capacity"; then
-                echo "Sin capacidad en Madrid. Reintentando en 15 segundos..."
-                sleep 15
-              else
-                echo "Error de OCI:"
-                echo "$RESPONSE"
-                exit $STATUS
-              fi
-            fi
-
-            ATTEMPT=$((ATTEMPT + 1))
-            unset STATUS
-          done
-
-          echo "Fin del ciclo de 4 minutos. Esperando a la siguiente ejecución programada."
+      - name: Open an issue when an instance is captured
+        if: steps.hunt.outputs.result == 'launched'
+        uses: actions/github-script@v7
+        env:
+          INSTANCE_ID: ${{ steps.hunt.outputs.instance_id }}
+          PUBLIC_IP: ${{ steps.hunt.outputs.public_ip }}
+          OCPUS: ${{ steps.hunt.outputs.ocpus }}
+          MEMORY: ${{ steps.hunt.outputs.memory }}
+          PLACEMENT: ${{ steps.hunt.outputs.placement }}
+        with:
+          script: |
+            const { INSTANCE_ID, PUBLIC_IP, OCPUS, MEMORY, PLACEMENT } = process.env;
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Ampere A1 captured: ${OCPUS} OCPU / ${MEMORY} GB`,
+              body: [
+                `An **VM.Standard.A1.Flex** instance was launched by [this run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}).`,
+                '',
+                `- Instance: \`${INSTANCE_ID}\``,
+                `- Shape: ${OCPUS} OCPU / ${MEMORY} GB`,
+                `- Placement: ${PLACEMENT}`,
+                `- Public IP: ${PUBLIC_IP || 'still provisioning - check the OCI console'}`,
+                '',
+                'Later runs stop on their own once the free-tier allowance is used up,',
+                'so nothing here will start a billable second instance. Disable the',
+                'schedule when you are done hunting.',
+              ].join('\n'),
+            });
