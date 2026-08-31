@@ -213,22 +213,23 @@ fi
 run_hunt throttle MOCK_SUCCEED_ON=999 HUNT_SECONDS=10 INTERVAL=1 JITTER=0 \
   MOCK_LAUNCH_ERROR='ServiceError: {"code": "TooManyRequests", "message": "Too many requests for the user", "status": 429}'
 if [ "$RC" -eq 0 ] && grep -q 'Slowing to 2s between attempts' <<< "$LOG" \
-   && grep -q 'Slowing to 4s' <<< "$LOG"; then
-  ok "backs off exponentially when OCI returns 429"
+   && grep -q 'Slowing to 3s' <<< "$LOG"; then
+  ok "backs off on every 429, half again each time"
 else
-  bad "backs off exponentially when OCI returns 429" "$LOG"
+  bad "backs off on every 429, half again each time" "$LOG"
 fi
 
 # --- 9b. A capacity miss must not throw away the learned pace -------------
 # The live run went clean/429/429/clean/429/429 because the pace reset to the
 # floor on every clean answer and instantly earned the next throttle.
 run_hunt pace MOCK_SUCCEED_ON=999 MOCK_THROTTLE_ON='1 2' HUNT_SECONDS=40 INTERVAL=4 JITTER=0
-if grep -q 'Slowing to 8s' <<< "$LOG" && grep -q 'Slowing to 16s' <<< "$LOG" \
-   && grep -q 'Next attempt in 12s' <<< "$LOG" \
-   && ! grep -q 'Next attempt in 4s' <<< "$LOG"; then
+FIRST_EASE=$(grep -oE 'Next attempt in [0-9]+s' <<< "$LOG" | head -1)
+if grep -q 'Slowing to 6s' <<< "$LOG" && grep -q 'Slowing to 9s' <<< "$LOG" \
+   && [ "$FIRST_EASE" = "Next attempt in 6s" ]; then
   ok "eases the pace down after a throttle instead of resetting to the floor"
 else
-  bad "eases the pace down after a throttle instead of resetting to the floor" "$LOG"
+  bad "eases the pace down after a throttle instead of resetting to the floor" "first eased pace: ${FIRST_EASE:-none}
+$LOG"
 fi
 
 # --- 9c. The summary calls out a window lost to throttling ----------------

@@ -340,7 +340,10 @@ while [ "$SECONDS" -lt "$DEADLINE" ]; do
       ;;
     throttled)
       THROTTLES=$(( THROTTLES + 1 ))
-      PACE=$(( PACE * 2 )); [ "$PACE" -gt 300 ] && PACE=300
+      # Half again, not double. Over a 5h45m run doubling overshot to 168s
+      # between attempts, and every second above the sustainable rate is a
+      # capacity check not made. Rounded up so small paces still grow.
+      PACE=$(( (PACE * 3 + 1) / 2 )); [ "$PACE" -gt 300 ] && PACE=300
       log "Rate-limited by OCI. Slowing to ${PACE}s between attempts."
       ;;
     transient)
