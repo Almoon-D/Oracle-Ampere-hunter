@@ -125,8 +125,17 @@ the OCI console:
   3. Tenancy OCID -- Profile -> Tenancy: <name> -> OCID.
      With Identity Domains, the user must be the domain user owning the key.
 
-If either length above looks short, the secret was truncated on paste; OCIDs
-run to roughly 80-100 characters. Re-copy it with the console's Copy link.
+Why the error cannot say which one is wrong: the request is signed with a key
+id of "<tenancy>/<user>/<fingerprint>". Oracle looks up that whole triple, and
+any one of the three being wrong fails the lookup as NotAuthenticated. So a
+correct key with the wrong user, or the wrong tenancy, looks identical to no
+key at all.
+
+Fastest fix, which sidesteps copying the three by hand: in the console open
+"Add API key", pick "Paste a public key" and paste the public half of the key
+you already have. Before closing, the dialog shows a "Configuration file
+preview" containing user, fingerprint, tenancy and region for this exact
+identity. Copy those four values straight into the matching secrets.
 
 To recompute the fingerprint from your private key locally:
   openssl rsa -pubout -outform DER -in your_key.pem | openssl md5 -c
