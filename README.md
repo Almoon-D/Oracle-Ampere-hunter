@@ -63,27 +63,39 @@ live API call to confirm the credentials are accepted.
 
 ## Running it
 
-It is built to be left alone. The schedule fires at **:07 and :37 every hour**
-and each firing hunts for 25 of those 30 minutes, so roughly 83% of wall-clock
-time is spent in front of Oracle's launch API. That beats a `*/5` schedule of
-four-minute runs, where most of each run went to reinstalling the CLI and the
-request pace never had time to settle.
+It is built to be left alone, and it keeps itself alive **by chaining, not by
+the schedule**.
 
-Two things worth knowing:
+Each run hunts for up to 350 minutes — the longest a GitHub job may live — and
+then, if it ended without capacity, dispatches the next run before it exits.
+That is a continuous loop with a handover roughly every 5¾ hours, depending on
+no scheduler at all.
 
-- GitHub runs scheduled workflows on a shared pool and **delays them**,
-  especially at the top of the hour — which is why the schedule sits at :07 and
-  :37. Overlapping firings queue behind each other rather than piling up.
-- **Scheduled workflows are disabled after 60 days without repository
-  activity.** If a long hunt goes quiet, check the schedule is still enabled.
+The chain exists because **the cron never fired**. Not once, across a full day,
+on `*/5` or on `7,37`, with the workflow `active` and the repository committed
+to all day. GitHub's scheduler is best-effort and it simply never ran this
+repository's schedule. The cron stays declared as a backstop in case it ever
+starts working; the `concurrency` group keeps a scheduled run and a chained one
+from overlapping.
 
-To hunt harder for a stretch, dispatch a long run: Actions → *Hunt Oracle
-Ampere A1* → *Run workflow* → `duration_minutes` = `350`. That is one ~5¾-hour
-run, paying the ~40s of setup once.
+`workflow_dispatch` is one of only two events `GITHUB_TOKEN` may use to start a
+new workflow run — every other event it triggers is ignored, precisely to stop
+runaway loops — and that is what makes the chain possible without a personal
+access token.
+
+The chain ends by itself when there is nothing left to hunt for: an instance
+captured, the allowance already spent, or no size that fits. It also ends if a
+run fails inside the first ten minutes, because that is what a broken
+configuration looks like and chaining on it would spin a new run every minute.
+A failure *after* ten minutes is treated as transient and the chain continues.
+
+To restart a stopped chain, or to run a one-off, use Actions → *Hunt Oracle
+Ampere A1* → *Run workflow*. Set `chain` to `false` for a test run that should
+not queue a successor.
 
 `duration_minutes` is the whole job budget and doubles as the job timeout; the
 hunt gets that minus four minutes, so a win still has time to be recorded
-rather than being cut off by the runner.
+rather than being cut off by the runner. A chained run always asks for 350.
 
 ### When it wins
 
@@ -107,7 +119,7 @@ disable the workflow in the Actions tab.
 ### Cost
 
 On a **public** repository, Actions minutes are free and this costs nothing, so
-the schedule can be left running indefinitely. On a **private** one, this
+the chain can be left running indefinitely. On a **private** one, this
 schedule burns roughly 1,200 minutes a day against a 2,000-minute monthly
 allowance — under two days. Make the repo public, or hunt with dispatched runs
 only.
@@ -126,12 +138,17 @@ Set these as `env:` on the *Hunt* step:
 | `INTERVAL` | `45` | Floor for seconds between attempts; the pace adapts upward from here |
 | `JITTER` | `5` | Random 0–4s added, so parallel hunters desynchronise |
 
-`INTERVAL` is only a floor. The hunt doubles its pace on every `TooManyRequests`
-and eases it back by a quarter on every clean answer, so it converges on the
-rate the tenancy actually tolerates rather than a guess. A live 10-minute run at
-a 20s floor spent two thirds of the window throttled, which is what set the
-default to 45s. The end-of-run summary reports capacity misses against
-throttles; if throttles dominate, raise the floor.
+`INTERVAL` is only a floor. The hunt raises its pace by half on every
+`TooManyRequests` and eases it back by a quarter on every clean answer, so it
+converges on the rate the tenancy actually tolerates rather than a guess.
+
+Those constants come from live runs. At a 20s floor with doubling, a 10-minute
+run spent two thirds of its window throttled — which set the floor to 45s. A
+5h45m run then made **230 attempts, 167 of them real capacity checks and 63
+throttled**, but doubling had overshot to 168s between attempts by the end,
+which is why a throttle now costs half again rather than double. The
+end-of-run summary reports misses against throttles; if throttles dominate,
+raise the floor.
 
 ## Tests
 
