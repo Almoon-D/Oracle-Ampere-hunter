@@ -59,7 +59,7 @@ DERIVED_FP=$(openssl pkey -in "$KEY_FILE" -pubout -outform DER 2>/dev/null \
 if [ -n "$DERIVED_FP" ] && [ "$DERIVED_FP" != "$FP_CLEAN" ]; then
   die "OCI_FINGERPRINT ($FP_CLEAN) does not match OCI_API_KEY (whose fingerprint is $DERIVED_FP). Fix one of the two secrets."
 fi
-log "Fingerprint matches the private key."
+log "Fingerprint matches the private key (${DERIVED_FP:0:5}...${DERIVED_FP: -5})."
 
 # --- 4. Sanity-check the OCIDs ------------------------------------------
 USER_CLEAN=$(printf '%s' "$OCI_USER_OCID" | tr -d ' \r\n\t"')
@@ -83,8 +83,42 @@ chmod 600 "$CFG_FILE"
 log "Wrote $CFG_FILE for region $REGION_CLEAN."
 
 # --- 6. Prove the credentials actually work ------------------------------
+# The warning about labelling the key file is noise here; the key is written
+# fresh from a secret on every run.
+export SUPPRESS_LABEL_WARNING=True
+
 if ! OUT=$(oci iam region-subscription list --config-file "$CFG_FILE" --no-retry 2>&1); then
   echo "$OUT" >&2
+  echo >&2
+
+  if printf '%s' "$OUT" | grep -qi 'NotAuthenticated'; then
+    # Everything checkable from this side already passed: the key parses, and
+    # its fingerprint matches OCI_FINGERPRINT. So the secrets agree with each
+    # other and the problem is on Oracle's side of the pairing -- it does not
+    # recognise this key as belonging to this user in this tenancy. Only the
+    # console can say which.
+    cat >&2 <<'HINT'
+The key and fingerprint are internally consistent, so the remaining causes are
+all about what Oracle has on record. In the OCI console, open
+  Profile (top right) -> My profile -> API keys
+and check, in order:
+
+  1. Is a key listed with the fingerprint shown above? If not, the public half
+     was never uploaded. Add it: "Add API key" -> "Paste a public key", pasting
+     the .pub/PEM public key that pairs with OCI_API_KEY.
+  2. Are you looking at the same user as OCI_USER_OCID? Copy the OCID from
+     "My profile" and compare it with the secret. A key uploaded to one user
+     will not authenticate another.
+  3. Is OCI_TENANCY_OCID the tenancy that user lives in? Profile -> Tenancy.
+     If the tenancy uses Identity Domains, the user must be the domain user
+     that owns the key.
+
+To recompute the fingerprint from your private key locally:
+  openssl rsa -pubout -outform DER -in your_key.pem | openssl md5 -c
+HINT
+    die "OCI rejected these credentials (401 NotAuthenticated). See the checklist above."
+  fi
+
   die "OCI rejected these credentials. Check the API key is still active on this user in the OCI console."
 fi
 log "Authenticated against OCI successfully."
