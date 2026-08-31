@@ -175,7 +175,16 @@ LADDER=()
 for n in $OCPU_LADDER; do
   [ "$n" -le "$REMAINING" ] && LADDER+=("$n")
 done
-[ ${#LADDER[@]} -gt 0 ] || fail "No ladder entry in '$OCPU_LADDER' fits the remaining $REMAINING OCPU(s)."
+if [ ${#LADDER[@]} -eq 0 ]; then
+  # Nothing to do rather than something broken: the allowance is partly used
+  # and no configured size fits what is left. Exit green, because this runs
+  # unattended on a schedule and a permanently red run trains you to ignore it.
+  echo "::warning::No size in OCPU_LADDER ('$OCPU_LADDER') fits the $REMAINING OCPU still available; nothing to hunt for."
+  summary "### Ampere A1 hunt — nothing that fits"
+  summary "$REMAINING OCPU of the ${ALLOWANCE} OCPU allowance is unallocated, but no size in \`$OCPU_LADDER\` fits it. Add a smaller size to the ladder to use the remainder."
+  emit "result=no-fit"
+  exit 0
+fi
 log "Sizes to try: ${LADDER[*]} OCPU."
 
 # ---------------------------------------------------------------------------

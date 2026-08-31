@@ -63,29 +63,54 @@ live API call to confirm the credentials are accepted.
 
 ## Running it
 
-The schedule (`*/5 * * * *`) starts hunting on its own. Two things to know
-about it:
+It is built to be left alone. The schedule fires at **:07 and :37 every hour**
+and each firing hunts for 25 of those 30 minutes, so roughly 83% of wall-clock
+time is spent in front of Oracle's launch API. That beats a `*/5` schedule of
+four-minute runs, where most of each run went to reinstalling the CLI and the
+request pace never had time to settle.
 
-- GitHub runs scheduled workflows on a shared pool and **delays them, often by
-  10–30 minutes**, especially at the top of the hour. `*/5` is a request, not a
-  promise.
+Two things worth knowing:
+
+- GitHub runs scheduled workflows on a shared pool and **delays them**,
+  especially at the top of the hour — which is why the schedule sits at :07 and
+  :37. Overlapping firings queue behind each other rather than piling up.
 - **Scheduled workflows are disabled after 60 days without repository
-  activity.** If a long hunt goes quiet, check that the schedule is still on.
+  activity.** If a long hunt goes quiet, check the schedule is still enabled.
 
-For a real hunt, dispatch a long run instead: Actions → *Hunt Oracle Ampere A1*
-→ *Run workflow* → set `duration_minutes` to `350`. One ~5¾-hour run covers far
-more of the day than 70 five-minute ones, and pays the ~40s of setup once.
+To hunt harder for a stretch, dispatch a long run: Actions → *Hunt Oracle
+Ampere A1* → *Run workflow* → `duration_minutes` = `350`. That is one ~5¾-hour
+run, paying the ~40s of setup once.
 
 `duration_minutes` is the whole job budget and doubles as the job timeout; the
-hunt itself gets that minus six minutes, so a win still has time to be recorded
+hunt gets that minus four minutes, so a win still has time to be recorded
 rather than being cut off by the runner.
+
+### When it wins
+
+The run opens a GitHub issue **assigned to the repository owner**, with the
+instance OCID and public IP. Assignment is what makes the notification
+reliable — GitHub always notifies an assignee, whatever the watch settings —
+and it reaches you by email if your account has email notifications enabled
+(Settings → Notifications → *Assigned*). The same details go to the run's job
+summary.
+
+No extra secrets are needed for that. If you want mail sent somewhere other
+than your GitHub account address, that needs an SMTP action and its own
+credentials as secrets; ask and it can be added.
+
+After a win, later runs cost about 45 seconds each: the pre-flight counts the
+A1 OCPUs you now hold, sees the allowance is spent and exits without launching.
+Leaving the schedule on is therefore safe and free, and it means hunting
+restarts by itself if the instance is ever terminated. To stop for good,
+disable the workflow in the Actions tab.
 
 ### Cost
 
-On a **public** repository, Actions minutes are free and this costs nothing. On
-a **private** one, the 5-minute schedule burns roughly 600–900 minutes a day
-against a 2,000-minute monthly allowance — it will run out in about three days.
-Make the repo public, or hunt with dispatched long runs only.
+On a **public** repository, Actions minutes are free and this costs nothing, so
+the schedule can be left running indefinitely. On a **private** one, this
+schedule burns roughly 1,200 minutes a day against a 2,000-minute monthly
+allowance — under two days. Make the repo public, or hunt with dispatched runs
+only.
 
 ## Tuning
 
@@ -93,7 +118,7 @@ Set these as `env:` on the *Hunt* step:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OCPU_LADDER` | `4 2 1` | Sizes tried at each placement, largest first |
+| `OCPU_LADDER` | `2` | Sizes tried at each placement, largest first. `2` alone means the full 2 OCPU / 12 GB or nothing |
 | `TARGET_OCPUS` | `4` | Free-tier allowance to fill; the run stops at it |
 | `GB_PER_OCPU` | `6` | Fixed by the free tier |
 | `BOOT_VOLUME_GB` | `50` | Free tier gives 200 GB total block storage |
@@ -111,7 +136,7 @@ throttles; if throttles dominate, raise the floor.
 ## Tests
 
 ```
-bash tests/test_hunt.sh      # 19 cases against tests/mock_oci.sh, no tenancy needed
+bash tests/test_hunt.sh      # 21 cases against tests/mock_oci.sh, no tenancy needed
 shellcheck -x scripts/*.sh tests/*.sh
 actionlint                   # workflow syntax; plain YAML parsing misses this
 ```

@@ -175,6 +175,30 @@ else
   bad "a 2 OCPU tenancy already running 1 OCPU asks for exactly 1 more" "$LOG"
 fi
 
+# --- 8h. A ladder with nothing that fits exits green, not red ------------
+# This runs unattended every half hour; a permanently red run is worse than
+# useless because it trains you to ignore the failure mail.
+run_hunt no_fit OCPU_LADDER=2 MOCK_CORE_LIMIT=2 MOCK_MEM_LIMIT=12 \
+  MOCK_EXISTING='[{"n":"a","s":"RUNNING","o":1.0}]'
+if [ "$RC" -eq 0 ] && grep -q 'result=no-fit' <<< "$OUT" \
+   && [ ! -f "$TMP/no_fit/state/launches" ]; then
+  ok "exits green when no ladder size fits the remaining allowance"
+else
+  bad "exits green when no ladder size fits the remaining allowance" "$OUT
+$LOG"
+fi
+
+# --- 8i. The 2-only ladder never settles for a smaller instance ----------
+run_hunt two_only OCPU_LADDER=2 MOCK_SUCCEED_ON=999 MOCK_CORE_LIMIT=2 MOCK_MEM_LIMIT=12 \
+  HUNT_SECONDS=6 INTERVAL=1 JITTER=0
+if grep -q 'Sizes to try: 2 OCPU' <<< "$LOG" \
+   && [ -s "$TMP/two_only/state/launches" ] \
+   && ! grep -qE '"ocpus": [134]' "$TMP/two_only/state/launches"; then
+  ok "with OCPU_LADDER=2 it only ever asks for 2 OCPU"
+else
+  bad "with OCPU_LADDER=2 it only ever asks for 2 OCPU" "$LOG"
+fi
+
 # --- 8e. Limits clamp the ladder before the first attempt ----------------
 run_hunt clamp MOCK_SUCCEED_ON=999 MOCK_CORE_LIMIT=2 MOCK_MEM_LIMIT=12
 if grep -q 'Tenancy A1 service limits: 2 OCPU / 12 GB' <<< "$LOG" \
