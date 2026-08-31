@@ -1,0 +1,73 @@
+name: Hunt Oracle Ampere A1
+
+on:
+  schedule:
+    # Se ejecuta cada 10 minutos
+    - cron: '*/10 * * * *'
+  workflow_dispatch: # Permite lanzarlo manualmente cuando quieras probar
+
+jobs:
+  launch-instance:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure OCI CLI
+        uses: oracle-actions/setup-oci-cli@v1.3.2
+        with:
+          user_ocid: ${{ secrets.OCI_USER_OCID }}
+          fingerprint: ${{ secrets.OCI_FINGERPRINT }}
+          tenancy_ocid: ${{ secrets.OCI_TENANCY_OCID }}
+          region: ${{ secrets.OCI_REGION }}
+          api_key: ${{ secrets.OCI_API_KEY }}
+
+      - name: Fetch Availability Domain & Ubuntu ARM Image
+        id: fetch-resources
+        run: |
+          # Obtener Availability Domain
+          AD=$(oci iam availability-domain list \
+            --compartment-id "${{ secrets.OCI_COMPARTMENT_OCID }}" \
+            --query "data[0].name" --raw-output)
+          echo "AD=$AD" >> $GITHUB_OUTPUT
+
+          # Buscar la imagen oficial más reciente de Canonical Ubuntu 24.04 para ARM
+          IMAGE_ID=$(oci compute image list \
+            --compartment-id "${{ secrets.OCI_COMPARTMENT_OCID }}" \
+            --operating-system "Canonical Ubuntu" \
+            --shape "VM.Standard.A1.Flex" \
+            --sort-by TIMECREATED --sort-order DESC \
+            --query "data[?contains(\"operating-system-version\", '24.04') && contains(\"display-name\", 'aarch64')].id | [0]" \
+            --raw-output)
+          echo "IMAGE_ID=$IMAGE_ID" >> $GITHUB_OUTPUT
+
+      - name: Attempt Instance Provisioning
+        id: provision
+        run: |
+          echo "Intentando lanzar máquina Ampere (2 OCPUs / 12 GB RAM)..."
+          
+          # Guardar la clave SSH pública temporalmente
+          echo "${{ secrets.SSH_PUBLIC_KEY }}" > ssh_key.pub
+
+          # Ejecución del comando de aprovisionamiento
+          RESPONSE=$(oci compute instance launch \
+            --availability-domain "${{ steps.fetch-resources.outputs.AD }}" \
+            --compartment-id "${{ secrets.OCI_COMPARTMENT_OCID }}" \
+            --shape "VM.Standard.A1.Flex" \
+            --shape-config '{"ocpus": 2, "memoryInGBs": 12}' \
+            --image-id "${{ steps.fetch-resources.outputs.IMAGE_ID }}" \
+            --subnet-id "${{ secrets.OCI_SUBNET_OCID }}" \
+            --display-name "ObliskIQ lite" \
+            --assign-public-ip true \
+            --ssh-authorized-keys-file ssh_key.pub 2>&1) || STATUS=$?
+
+          if [ -z "$STATUS" ]; then
+            echo "¡Éxito! Máquina creada correctamente."
+            echo "$RESPONSE"
+          else
+            if echo "$RESPONSE" | grep -q "Out of host capacity"; then
+              echo "Sin capacidad disponible en Madrid actualmente. Se reintentará en la siguiente ejecución."
+            else
+              echo "Error inesperado de OCI:"
+              echo "$RESPONSE"
+              exit $STATUS
+            fi
+          fi
