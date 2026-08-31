@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+# Hunt for free-tier Ampere A1 capacity.
+#
+# Deliberately not `set -e`: a failed launch is the expected case, not an
+# error, and the classifier below decides what each failure means.
+set -uo pipefail
+
+: "${OCI_COMPARTMENT_OCID:?OCI_COMPARTMENT_OCID is required}"
+: "${OCI_SUBNET_OCID:?OCI_SUBNET_OCID is required}"
+
+SHAPE="${SHAPE:-VM.Standard.A1.Flex}"
+OCPU_LADDER="${OCPU_LADDER:-4 2 1}"     # tried largest-first at each placement
+TARGET_OCPUS="${TARGET_OCPUS:-4}"        # free-tier A1 allowance
+GB_PER_OCPU="${GB_PER_OCPU:-6}"          # free tier is fixed at 6 GB per OCPU
+BOOT_VOLUME_GB="${BOOT_VOLUME_GB:-50}"
+DISPLAY_NAME="${DISPLAY_NAME:-ObliskIQ-lite}"
+OS_NAME="${OS_NAME:-Canonical Ubuntu}"
+OS_VERSION="${OS_VERSION:-24.04}"
+SSH_KEY_FILE="${SSH_KEY_FILE:-ssh_key.pub}"
+HUNT_SECONDS="${HUNT_SECONDS:-240}"
+INTERVAL="${INTERVAL:-20}"               # base seconds between launch attempts
+JITTER="${JITTER:-5}"                    # random 0..JITTER-1s added to each wait
+MAX_UNKNOWN="${MAX_UNKNOWN:-5}"
+
+OCI="${OCI_BIN:-oci}"
+COMPARTMENT=$(printf '%s' "$OCI_COMPARTMENT_OCID" | tr -d ' \r\n\t"')
+SUBNET=$(printf '%s' "$OCI_SUBNET_OCID" | tr -d ' \r\n\t"')
+
+log()  { echo "[$(date -u +%H:%M:%S)] $*"; }
+fail() { echo "::error::$*" >&2; exit 1; }
+
+summary() { [ -n "${GITHUB_STEP_SUMMARY:-}" ] && printf '%s\n' "$*" >> "$GITHUB_STEP_SUMMARY"; return 0; }
+emit()    { [ -n "${GITHUB_OUTPUT:-}" ] && printf '%s\n' "$*" >> "$GITHUB_OUTPUT"; return 0; }
+
+ocic() { "$OCI" --no-retry "$@"; }
+
+# ---------------------------------------------------------------------------
+# Classify an OCI error. Order matters: "Out of host capacity" is delivered as
+# an HTTP 500 InternalError, so it has to be matched before the generic 5xx
+# rule, or every capacity miss would look like a transient server fault.
+# ---------------------------------------------------------------------------
+classify() {
+  local msg
+  msg=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$msg" in
+    *"out of host capacity"*|*"out of capacity"*|*"insufficient capacity"*|*"capacity is not available"*)
+      echo capacity ;;
+    *"too many requests"*|*toomanyrequests*|*"rate limit"*|*"429"*)
+      echo throttled ;;
+    *limitexceeded*|*"limit exceeded"*|*"quota"*|*"service limit"*|*"exceeded the limit"*)
+      echo quota ;;
+    *notauthenticated*|*notauthorized*|*"not authorized"*|*"authorization failed"*|*"invalid signature"*|*"401"*|*"403"*)
+      echo auth ;;
+    *invalidparameter*|*"cannot be null"*|*"is not valid"*|*notfound*|*"not found"*|*"404"*)
+      echo badrequest ;;
+    *internalerror*|*"500"*|*"502"*|*"503"*|*"504"*|*timeout*|*"timed out"*|*"connection"*)
+      echo transient ;;
+    *) echo unknown ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Pre-flight: never launch past the free-tier allowance.
+# The original workflow had no such guard, so once a run succeeded the cron
+# kept launching more instances -- straight past the free tier into billing.
+# ---------------------------------------------------------------------------
+log "Checking what this compartment already holds..."
+if ! EXISTING=$(ocic compute instance list \
+  --compartment-id "$COMPARTMENT" --all \
+  --query "data[?\"shape\"=='$SHAPE' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'].{n:\"display-name\",s:\"lifecycle-state\",o:\"shape-config\".ocpus}" \
+  --output json 2>&1); then
+  echo "$EXISTING" >&2
+  fail "Could not list existing instances; refusing to launch blind."
+fi
+
+USED=$(printf '%s' "$EXISTING" | python3 -c '
+import sys, json
+try:
+    rows = json.loads(sys.stdin.read() or "[]") or []
+except Exception:
+    sys.exit(9)
+print(int(sum(float(r.get("o") or 0) for r in rows)))
+' 2>/dev/null) || fail "Unexpected response while counting existing $SHAPE instances."
+
+printf '%s' "$EXISTING" | python3 -c '
+import sys, json
+for r in json.loads(sys.stdin.read() or "[]") or []:
+    print(f"  - {r.get(\"n\")}: {r.get(\"s\")} ({r.get(\"o\")} OCPU)")
+' 2>/dev/null
+
+REMAINING=$(( TARGET_OCPUS - USED ))
+log "$SHAPE OCPUs already allocated: $USED of $TARGET_OCPUS (remaining: $REMAINING)."
+
+if [ "$REMAINING" -le 0 ]; then
+  log "Free-tier A1 allowance is already fully used. Nothing to hunt."
+  summary "### Ampere A1 hunt — nothing to do"
+  summary "All $TARGET_OCPUS free-tier OCPUs are already allocated. Launching more would be billable, so this run stopped."
+  emit "result=already-satisfied"
+  exit 0
+fi
+
+# Only ladder rungs that still fit in the remaining free allowance.
+LADDER=()
+for n in $OCPU_LADDER; do
+  [ "$n" -le "$REMAINING" ] && LADDER+=("$n")
+done
+[ ${#LADDER[@]} -gt 0 ] || fail "No ladder entry in '$OCPU_LADDER' fits the remaining $REMAINING OCPU(s)."
+log "Sizes to try: ${LADDER[*]} OCPU."
+
+# ---------------------------------------------------------------------------
+# Resources: image, every availability domain, every fault domain.
+# The original only ever tried availability domain [0] and one fault domain,
+# throwing away most of the placements capacity can free up in.
+# ---------------------------------------------------------------------------
+IMAGE_ID=$(ocic compute image list \
+  --compartment-id "$COMPARTMENT" \
+  --operating-system "$OS_NAME" \
+  --operating-system-version "$OS_VERSION" \
+  --shape "$SHAPE" \
+  --sort-by TIMECREATED --sort-order DESC \
+  --query "data[?contains(\"display-name\", 'aarch64') && !contains(\"display-name\", 'Minimal')].id | [0]" \
+  --raw-output 2>&1)
+
+case "$IMAGE_ID" in
+  ocid1.image.*) ;;
+  *) fail "No $OS_NAME $OS_VERSION aarch64 image found for $SHAPE. Response: ${IMAGE_ID:-<empty>}" ;;
+esac
+log "Image: $IMAGE_ID"
+
+mapfile -t ADS < <(ocic iam availability-domain list \
+  --compartment-id "$COMPARTMENT" --query 'data[].name' --output json 2>/dev/null \
+  | python3 -c 'import sys,json; [print(x) for x in json.loads(sys.stdin.read() or "[]") or []]' 2>/dev/null)
+[ ${#ADS[@]} -gt 0 ] || fail "Could not list availability domains for this compartment."
+log "Availability domains: ${ADS[*]}"
+
+# Placements, in round-robin order across ADs and fault domains.
+PLACEMENTS=()
+for ad in "${ADS[@]}"; do
+  mapfile -t FDS < <(ocic iam fault-domain list \
+    --compartment-id "$COMPARTMENT" --availability-domain "$ad" \
+    --query 'data[].name' --output json 2>/dev/null \
+    | python3 -c 'import sys,json; [print(x) for x in json.loads(sys.stdin.read() or "[]") or []]' 2>/dev/null)
+  # An empty fault-domain list is fine: "" means "let OCI choose".
+  [ ${#FDS[@]} -gt 0 ] || FDS=("")
+  for fd in "${FDS[@]}"; do
+    PLACEMENTS+=("$ad|$fd")
+  done
+done
+log "Placements to rotate through: ${#PLACEMENTS[@]}"
+
+# Flat attempt list: every placement, largest size first at each one.
+ATTEMPTS=()
+for p in "${PLACEMENTS[@]}"; do
+  for n in "${LADDER[@]}"; do
+    ATTEMPTS+=("$n|$p")
+  done
+done
+
+[ -r "$SSH_KEY_FILE" ] || fail "SSH public key file '$SSH_KEY_FILE' is missing."
+if command -v ssh-keygen >/dev/null 2>&1; then
+  ssh-keygen -l -f "$SSH_KEY_FILE" >/dev/null 2>&1 || SSH_BAD=1
+elif ! grep -qE '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-[a-z0-9]+) [A-Za-z0-9+/=]+' "$SSH_KEY_FILE"; then
+  SSH_BAD=1
+fi
+[ -z "${SSH_BAD:-}" ] \
+  || fail "SSH_PUBLIC_KEY is not a valid OpenSSH public key. It must be the one-line .pub file (starting with ssh-ed25519 or ssh-rsa), not the private key."
+
+# ---------------------------------------------------------------------------
+# The hunt.
+# ---------------------------------------------------------------------------
+DEADLINE=$(( SECONDS + HUNT_SECONDS ))
+ATTEMPT=0
+UNKNOWN_STREAK=0
+BACKOFF="$INTERVAL"
+declare -A SEEN_ERRORS=()
+
+log "Hunting for ${HUNT_SECONDS}s, one attempt every ~${INTERVAL}s."
+
+while [ "$SECONDS" -lt "$DEADLINE" ]; do
+  IFS='|' read -r ocpus ad fd <<< "${ATTEMPTS[$(( ATTEMPT % ${#ATTEMPTS[@]} ))]}"
+  ATTEMPT=$(( ATTEMPT + 1 ))
+  mem=$(( ocpus * GB_PER_OCPU ))
+
+  args=(
+    compute instance launch
+    --availability-domain "$ad"
+    --compartment-id "$COMPARTMENT"
+    --shape "$SHAPE"
+    --shape-config "{\"ocpus\": $ocpus, \"memoryInGBs\": $mem}"
+    --image-id "$IMAGE_ID"
+    --subnet-id "$SUBNET"
+    --display-name "$DISPLAY_NAME"
+    --assign-public-ip true
+    --boot-volume-size-in-gbs "$BOOT_VOLUME_GB"
+    --ssh-authorized-keys-file "$SSH_KEY_FILE"
+    --freeform-tags '{"created-by":"oracle-ampere-hunter"}'
+  )
+  [ -n "$fd" ] && args+=(--fault-domain "$fd")
+
+  log "Attempt #$ATTEMPT: ${ocpus} OCPU / ${mem} GB in $ad${fd:+ / $fd}"
+  RESPONSE=$(ocic "${args[@]}" 2>&1)
+  RC=$?
+
+  if [ "$RC" -eq 0 ]; then
+    INSTANCE_ID=$(printf '%s' "$RESPONSE" | python3 -c \
+      'import sys,json; print((json.load(sys.stdin).get("data") or {}).get("id",""))' 2>/dev/null)
+    if [ -n "$INSTANCE_ID" ]; then
+      log "GOT ONE. Instance $INSTANCE_ID (${ocpus} OCPU / ${mem} GB, $ad${fd:+ / $fd})"
+      emit "result=launched"
+      emit "instance_id=$INSTANCE_ID"
+      emit "ocpus=$ocpus"
+      emit "memory=$mem"
+      emit "placement=$ad${fd:+ / $fd}"
+
+      IP=""
+      for _ in $(seq 1 20); do
+        IP=$(ocic compute instance list-vnics --instance-id "$INSTANCE_ID" \
+              --query 'data[0]."public-ip"' --raw-output 2>/dev/null)
+        [ -n "$IP" ] && [ "$IP" != "null" ] && break
+        IP=""
+        sleep 6
+      done
+      emit "public_ip=$IP"
+
+      summary "### 🎉 Ampere A1 captured"
+      summary ""
+      summary "| | |"
+      summary "|---|---|"
+      summary "| Instance | \`$INSTANCE_ID\` |"
+      summary "| Shape | $SHAPE — ${ocpus} OCPU / ${mem} GB |"
+      summary "| Placement | $ad${fd:+ / $fd} |"
+      summary "| Public IP | ${IP:-pending} |"
+      summary "| Attempts this run | $ATTEMPT |"
+      exit 0
+    fi
+    log "Launch returned success but no instance id; treating as a failure."
+    RESPONSE="empty response body"
+  fi
+
+  KIND=$(classify "$RESPONSE")
+  FIRST_LINE=$(printf '%s' "$RESPONSE" | tr '\n' ' ' | cut -c1-300)
+
+  case "$KIND" in
+    capacity)
+      log "No capacity here. Rotating placement."
+      BACKOFF="$INTERVAL"
+      ;;
+    throttled)
+      BACKOFF=$(( BACKOFF * 2 )); [ "$BACKOFF" -gt 300 ] && BACKOFF=300
+      log "Rate-limited by OCI. Backing off ${BACKOFF}s."
+      ;;
+    transient)
+      BACKOFF=$(( INTERVAL * 2 ))
+      log "Transient OCI error, retrying: $FIRST_LINE"
+      ;;
+    quota)
+      summary "### Ampere A1 hunt stopped — service limit"
+      summary "\`\`\`"
+      summary "$FIRST_LINE"
+      summary "\`\`\`"
+      fail "OCI reports a limit/quota problem, which retrying cannot fix: $FIRST_LINE"
+      ;;
+    auth|badrequest)
+      summary "### Ampere A1 hunt stopped — configuration error"
+      summary "\`\`\`"
+      summary "$FIRST_LINE"
+      summary "\`\`\`"
+      fail "Configuration error, which retrying cannot fix: $FIRST_LINE"
+      ;;
+    unknown)
+      UNKNOWN_STREAK=$(( UNKNOWN_STREAK + 1 ))
+      if [ -z "${SEEN_ERRORS[$FIRST_LINE]:-}" ]; then
+        SEEN_ERRORS[$FIRST_LINE]=1
+        log "Unrecognised OCI error (#$UNKNOWN_STREAK): $FIRST_LINE"
+      fi
+      if [ "$UNKNOWN_STREAK" -ge "$MAX_UNKNOWN" ]; then
+        fail "$MAX_UNKNOWN consecutive unrecognised errors, last: $FIRST_LINE"
+      fi
+      BACKOFF=$(( INTERVAL * 2 ))
+      ;;
+  esac
+  [ "$KIND" = unknown ] || UNKNOWN_STREAK=0
+
+  # Jitter, so a fleet of these does not hammer OCI on the same second.
+  SLEEP=$(( BACKOFF + (JITTER > 0 ? RANDOM % JITTER : 0) ))
+  [ $(( SECONDS + SLEEP )) -lt "$DEADLINE" ] || break
+  sleep "$SLEEP"
+done
+
+log "Window closed after $ATTEMPT attempts without capacity. This is normal."
+summary "### Ampere A1 hunt — no capacity this run"
+summary "$ATTEMPT attempts across ${#PLACEMENTS[@]} placement(s) and sizes ${LADDER[*]} OCPU. Will try again on the next run."
+emit "result=no-capacity"
+exit 0
