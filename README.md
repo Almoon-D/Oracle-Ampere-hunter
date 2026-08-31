@@ -29,11 +29,15 @@ Each run:
 3. **Rotates placements.** Every availability domain and every fault domain, in
    turn, largest size first at each one. Capacity frees up per host pool, so a
    miss in one fault domain says nothing about the next.
-4. **Reads the error before reacting.** `Out of host capacity` means rotate and
-   retry. `TooManyRequests` means back off exponentially. `NotAuthenticated` or
-   `LimitExceeded` mean stop — no amount of retrying fixes a wrong fingerprint
-   or an exhausted service limit.
-5. **Exits green when it simply did not win.** No capacity is the normal
+4. **Fits the request to the tenancy's service limits.** The A1 limits are read
+   up front and the ladder is clamped to them, so it never spends attempts
+   asking for more than the tenancy is allowed.
+5. **Reads the error before reacting.** `Out of host capacity` means rotate and
+   retry. `TooManyRequests` means back off exponentially. `NotAuthenticated`
+   means stop — no retry fixes a wrong fingerprint. `LimitExceeded` means this
+   *size* is too big, so the ladder drops a rung and keeps hunting; it is only
+   fatal once even the smallest size is refused.
+6. **Exits green when it simply did not win.** No capacity is the normal
    outcome, not a failure; failing the job on it would bury the real errors and
    fill your inbox.
 
@@ -59,29 +63,54 @@ live API call to confirm the credentials are accepted.
 
 ## Running it
 
-The schedule (`*/5 * * * *`) starts hunting on its own. Two things to know
-about it:
+It is built to be left alone. The schedule fires at **:07 and :37 every hour**
+and each firing hunts for 25 of those 30 minutes, so roughly 83% of wall-clock
+time is spent in front of Oracle's launch API. That beats a `*/5` schedule of
+four-minute runs, where most of each run went to reinstalling the CLI and the
+request pace never had time to settle.
 
-- GitHub runs scheduled workflows on a shared pool and **delays them, often by
-  10–30 minutes**, especially at the top of the hour. `*/5` is a request, not a
-  promise.
+Two things worth knowing:
+
+- GitHub runs scheduled workflows on a shared pool and **delays them**,
+  especially at the top of the hour — which is why the schedule sits at :07 and
+  :37. Overlapping firings queue behind each other rather than piling up.
 - **Scheduled workflows are disabled after 60 days without repository
-  activity.** If a long hunt goes quiet, check that the schedule is still on.
+  activity.** If a long hunt goes quiet, check the schedule is still enabled.
 
-For a real hunt, dispatch a long run instead: Actions → *Hunt Oracle Ampere A1*
-→ *Run workflow* → set `duration_minutes` to `350`. One ~5¾-hour run covers far
-more of the day than 70 five-minute ones, and pays the ~40s of setup once.
+To hunt harder for a stretch, dispatch a long run: Actions → *Hunt Oracle
+Ampere A1* → *Run workflow* → `duration_minutes` = `350`. That is one ~5¾-hour
+run, paying the ~40s of setup once.
 
 `duration_minutes` is the whole job budget and doubles as the job timeout; the
-hunt itself gets that minus six minutes, so a win still has time to be recorded
+hunt gets that minus four minutes, so a win still has time to be recorded
 rather than being cut off by the runner.
+
+### When it wins
+
+The run opens a GitHub issue **assigned to the repository owner**, with the
+instance OCID and public IP. Assignment is what makes the notification
+reliable — GitHub always notifies an assignee, whatever the watch settings —
+and it reaches you by email if your account has email notifications enabled
+(Settings → Notifications → *Assigned*). The same details go to the run's job
+summary.
+
+No extra secrets are needed for that. If you want mail sent somewhere other
+than your GitHub account address, that needs an SMTP action and its own
+credentials as secrets; ask and it can be added.
+
+After a win, later runs cost about 45 seconds each: the pre-flight counts the
+A1 OCPUs you now hold, sees the allowance is spent and exits without launching.
+Leaving the schedule on is therefore safe and free, and it means hunting
+restarts by itself if the instance is ever terminated. To stop for good,
+disable the workflow in the Actions tab.
 
 ### Cost
 
-On a **public** repository, Actions minutes are free and this costs nothing. On
-a **private** one, the 5-minute schedule burns roughly 600–900 minutes a day
-against a 2,000-minute monthly allowance — it will run out in about three days.
-Make the repo public, or hunt with dispatched long runs only.
+On a **public** repository, Actions minutes are free and this costs nothing, so
+the schedule can be left running indefinitely. On a **private** one, this
+schedule burns roughly 1,200 minutes a day against a 2,000-minute monthly
+allowance — under two days. Make the repo public, or hunt with dispatched runs
+only.
 
 ## Tuning
 
@@ -89,27 +118,32 @@ Set these as `env:` on the *Hunt* step:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OCPU_LADDER` | `4 2 1` | Sizes tried at each placement, largest first |
+| `OCPU_LADDER` | `2` | Sizes tried at each placement, largest first. `2` alone means the full 2 OCPU / 12 GB or nothing |
 | `TARGET_OCPUS` | `4` | Free-tier allowance to fill; the run stops at it |
 | `GB_PER_OCPU` | `6` | Fixed by the free tier |
 | `BOOT_VOLUME_GB` | `50` | Free tier gives 200 GB total block storage |
 | `OS_NAME` / `OS_VERSION` | `Canonical Ubuntu` / `24.04` | Image to launch |
-| `INTERVAL` | `20` | Base seconds between attempts |
+| `INTERVAL` | `45` | Floor for seconds between attempts; the pace adapts upward from here |
 | `JITTER` | `5` | Random 0–4s added, so parallel hunters desynchronise |
 
-`INTERVAL` is the knob to be careful with. Attempts faster than ~15s get you
-`TooManyRequests`, and time spent backing off is time not spent hunting.
+`INTERVAL` is only a floor. The hunt doubles its pace on every `TooManyRequests`
+and eases it back by a quarter on every clean answer, so it converges on the
+rate the tenancy actually tolerates rather than a guess. A live 10-minute run at
+a 20s floor spent two thirds of the window throttled, which is what set the
+default to 45s. The end-of-run summary reports capacity misses against
+throttles; if throttles dominate, raise the floor.
 
 ## Tests
 
 ```
-bash tests/test_hunt.sh      # 11 cases against tests/mock_oci.sh, no tenancy needed
+bash tests/test_hunt.sh      # 21 cases against tests/mock_oci.sh, no tenancy needed
 shellcheck -x scripts/*.sh tests/*.sh
 actionlint                   # workflow syntax; plain YAML parsing misses this
 ```
 
-The mock lets the failure paths that matter — the free-tier guard, the
-capacity/throttle/auth/quota classifier, placement rotation — be exercised
+The mock lets the failure paths that matter — the free-tier guard, service
+limit clamping and step-down, the capacity/throttle/auth classifier, placement
+rotation, and stdout/stderr separation — be exercised
 without waiting on real capacity. CI runs both on every push.
 
 ## When you win

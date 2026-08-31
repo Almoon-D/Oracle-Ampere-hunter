@@ -59,9 +59,19 @@ DERIVED_FP=$(openssl pkey -in "$KEY_FILE" -pubout -outform DER 2>/dev/null \
 if [ -n "$DERIVED_FP" ] && [ "$DERIVED_FP" != "$FP_CLEAN" ]; then
   die "OCI_FINGERPRINT ($FP_CLEAN) does not match OCI_API_KEY (whose fingerprint is $DERIVED_FP). Fix one of the two secrets."
 fi
-log "Fingerprint matches the private key."
+log "Fingerprint matches the private key (${DERIVED_FP:0:5}...${DERIVED_FP: -5})."
 
 # --- 4. Sanity-check the OCIDs ------------------------------------------
+# Enough of each OCID to compare against the console, never the whole value.
+# The full string is a repository secret and would be masked in the log; a
+# substring is not, and the length exposes a truncated paste.
+ocid_hint() {
+  local v="$1"
+  local n=${#v}
+  if [ "$n" -le 24 ]; then printf '%s (length %d - suspiciously short)' "$v" "$n"
+  else printf '%s...%s (length %d)' "${v:0:20}" "${v: -6}" "$n"; fi
+}
+
 USER_CLEAN=$(printf '%s' "$OCI_USER_OCID" | tr -d ' \r\n\t"')
 TENANCY_CLEAN=$(printf '%s' "$OCI_TENANCY_OCID" | tr -d ' \r\n\t"')
 REGION_CLEAN=$(printf '%s' "$OCI_REGION" | tr -d ' \r\n\t"')
@@ -69,6 +79,9 @@ REGION_CLEAN=$(printf '%s' "$OCI_REGION" | tr -d ' \r\n\t"')
 case "$USER_CLEAN" in ocid1.user.*) ;; *) die "OCI_USER_OCID must start with 'ocid1.user.' (got '${USER_CLEAN:0:24}...')." ;; esac
 case "$TENANCY_CLEAN" in ocid1.tenancy.*) ;; *) die "OCI_TENANCY_OCID must start with 'ocid1.tenancy.' (got '${TENANCY_CLEAN:0:24}...')." ;; esac
 [ -n "$REGION_CLEAN" ] || die "OCI_REGION is empty (e.g. eu-madrid-1)."
+
+log "User OCID:    $(ocid_hint "$USER_CLEAN")"
+log "Tenancy OCID: $(ocid_hint "$TENANCY_CLEAN")"
 
 # --- 5. Write the config -------------------------------------------------
 cat > "$CFG_FILE" <<EOF
@@ -83,8 +96,53 @@ chmod 600 "$CFG_FILE"
 log "Wrote $CFG_FILE for region $REGION_CLEAN."
 
 # --- 6. Prove the credentials actually work ------------------------------
+# The warning about labelling the key file is noise here; the key is written
+# fresh from a secret on every run.
+export SUPPRESS_LABEL_WARNING=True
+
 if ! OUT=$(oci iam region-subscription list --config-file "$CFG_FILE" --no-retry 2>&1); then
   echo "$OUT" >&2
+  echo >&2
+
+  if printf '%s' "$OUT" | grep -qi 'NotAuthenticated'; then
+    # Everything checkable from this side already passed: the key parses, and
+    # its fingerprint matches OCI_FINGERPRINT. So the secrets agree with each
+    # other and the problem is on Oracle's side of the pairing -- it does not
+    # recognise this key as belonging to this user in this tenancy. Only the
+    # console can say which.
+    cat >&2 <<'HINT'
+The key and fingerprint are internally consistent, so the remaining causes are
+all about what Oracle has on record. Compare the values printed above against
+the OCI console:
+
+  1. Fingerprint -- Profile (top right) -> My profile -> API keys.
+     If no key with that fingerprint is listed, the public half was never
+     uploaded: "Add API key" -> "Paste a public key", pasting the public key
+     that pairs with OCI_API_KEY.
+  2. User OCID -- My profile -> OCID (use the Copy link, do not retype).
+     A key uploaded to one user will not authenticate another, and this is the
+     usual culprit once the fingerprint checks out.
+  3. Tenancy OCID -- Profile -> Tenancy: <name> -> OCID.
+     With Identity Domains, the user must be the domain user owning the key.
+
+Why the error cannot say which one is wrong: the request is signed with a key
+id of "<tenancy>/<user>/<fingerprint>". Oracle looks up that whole triple, and
+any one of the three being wrong fails the lookup as NotAuthenticated. So a
+correct key with the wrong user, or the wrong tenancy, looks identical to no
+key at all.
+
+Fastest fix, which sidesteps copying the three by hand: in the console open
+"Add API key", pick "Paste a public key" and paste the public half of the key
+you already have. Before closing, the dialog shows a "Configuration file
+preview" containing user, fingerprint, tenancy and region for this exact
+identity. Copy those four values straight into the matching secrets.
+
+To recompute the fingerprint from your private key locally:
+  openssl rsa -pubout -outform DER -in your_key.pem | openssl md5 -c
+HINT
+    die "OCI rejected these credentials (401 NotAuthenticated). See the checklist above."
+  fi
+
   die "OCI rejected these credentials. Check the API key is still active on this user in the OCI console."
 fi
 log "Authenticated against OCI successfully."
