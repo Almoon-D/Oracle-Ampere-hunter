@@ -9,9 +9,9 @@ on:
   workflow_dispatch:
     inputs:
       duration_minutes:
-        description: 'Minutes to hunt in this run (max 330 - a job cannot exceed 6h).'
+        description: 'Total minutes for this run, setup included (max 350 - a job cannot exceed 6h).'
         required: false
-        default: '4'
+        default: '10'
       ocpu_ladder:
         description: 'OCPU sizes to try at each placement, largest first.'
         required: false
@@ -33,7 +33,7 @@ permissions:
 jobs:
   hunt:
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ fromJSON(github.event.inputs.duration_minutes || '4') + 6 }}
+    timeout-minutes: ${{ fromJSON(github.event.inputs.duration_minutes || '10') }}
 
     steps:
       - uses: actions/checkout@v4
@@ -71,14 +71,20 @@ jobs:
           OCI_SUBNET_OCID: ${{ secrets.OCI_SUBNET_OCID }}
           OCPU_LADDER: ${{ github.event.inputs.ocpu_ladder || '4 2 1' }}
           DISPLAY_NAME: ${{ github.event.inputs.display_name || 'ObliskIQ-lite' }}
-          DURATION_MINUTES: ${{ github.event.inputs.duration_minutes || '4' }}
+          DURATION_MINUTES: ${{ github.event.inputs.duration_minutes || '10' }}
         run: |
           set -euo pipefail
-          # A job is capped at 6h; leave room for setup and the wrap-up steps.
+          # DURATION_MINUTES is the whole job budget and is also the job's
+          # timeout-minutes. Hold back HEADROOM minutes so the hunt ends on its
+          # own terms -- reporting a win, writing the summary -- rather than
+          # being cut off mid-launch by the runner.
+          HEADROOM=6
           MINUTES=$DURATION_MINUTES
-          [ "$MINUTES" -gt 330 ] 2>/dev/null && MINUTES=330
-          export HUNT_SECONDS=$(( MINUTES * 60 ))
-          ./scripts/hunt.sh
+          [ "$MINUTES" -gt 350 ] && MINUTES=350
+          WINDOW=$(( (MINUTES - HEADROOM) * 60 ))
+          [ "$WINDOW" -lt 60 ] && WINDOW=60
+          echo "Job budget ${MINUTES}m, hunting window $(( WINDOW / 60 ))m."
+          HUNT_SECONDS=$WINDOW ./scripts/hunt.sh
 
       - name: Open an issue when an instance is captured
         if: steps.hunt.outputs.result == 'launched'

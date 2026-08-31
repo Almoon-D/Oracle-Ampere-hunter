@@ -69,8 +69,12 @@ about it:
   activity.** If a long hunt goes quiet, check that the schedule is still on.
 
 For a real hunt, dispatch a long run instead: Actions → *Hunt Oracle Ampere A1*
-→ *Run workflow* → set `duration_minutes` to `330`. One 5½-hour run covers far
-more of the day than 66 five-minute ones, and pays the ~40s of setup once.
+→ *Run workflow* → set `duration_minutes` to `350`. One ~5¾-hour run covers far
+more of the day than 70 five-minute ones, and pays the ~40s of setup once.
+
+`duration_minutes` is the whole job budget and doubles as the job timeout; the
+hunt itself gets that minus six minutes, so a win still has time to be recorded
+rather than being cut off by the runner.
 
 ### Cost
 
@@ -101,6 +105,7 @@ Set these as `env:` on the *Hunt* step:
 ```
 bash tests/test_hunt.sh      # 11 cases against tests/mock_oci.sh, no tenancy needed
 shellcheck -x scripts/*.sh tests/*.sh
+actionlint                   # workflow syntax; plain YAML parsing misses this
 ```
 
 The mock lets the failure paths that matter — the free-tier guard, the
