@@ -7,6 +7,13 @@ ARGS="$*"
 STATE="${MOCK_STATE_DIR:?}"
 mkdir -p "$STATE"
 
+# The real CLI writes this to stderr on every single call unless
+# SUPPRESS_LABEL_WARNING is set. Emitting it here keeps the tests honest about
+# stdout/stderr separation: folding it into stdout corrupts every JSON read.
+if [ -z "${SUPPRESS_LABEL_WARNING:-}" ]; then
+  echo "Warning: To increase security of your API key located at /home/runner/.oci/oci_api_key.pem, append an extra line with 'OCI_API_KEY' at the end." >&2
+fi
+
 case "$ARGS" in
   *"compute instance list-vnics"*)
     echo '203.0.113.42'; exit 0 ;;

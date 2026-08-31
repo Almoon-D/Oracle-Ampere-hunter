@@ -33,6 +33,12 @@ permissions:
 jobs:
   hunt:
     runs-on: ubuntu-latest
+    env:
+      # The CLI writes a key-file label warning to stderr on every call. The
+      # key here is written fresh from a secret each run, so the advice does not
+      # apply, and the noise sits in the middle of error output.
+      SUPPRESS_LABEL_WARNING: 'True'
+
     timeout-minutes: ${{ fromJSON(github.event.inputs.duration_minutes || '10') }}
 
     steps:

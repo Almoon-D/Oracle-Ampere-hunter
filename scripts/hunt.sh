@@ -32,7 +32,24 @@ fail() { echo "::error::$*" >&2; exit 1; }
 summary() { [ -n "${GITHUB_STEP_SUMMARY:-}" ] && printf '%s\n' "$*" >> "$GITHUB_STEP_SUMMARY"; return 0; }
 emit()    { [ -n "${GITHUB_OUTPUT:-}" ] && printf '%s\n' "$*" >> "$GITHUB_OUTPUT"; return 0; }
 
+# The CLI writes a key-file label warning to stderr on every call; without this
+# every JSON read would have to strip it.
+export SUPPRESS_LABEL_WARNING=True
+
 ocic() { "$OCI" --no-retry "$@"; }
+
+# Run an oci command keeping the streams apart, because stdout is parsed as
+# JSON and stderr carries warnings that would corrupt it. Sets OCI_OUT/OCI_ERR.
+OCI_OUT=""; OCI_ERR=""
+ocic_capture() {
+  local err_file rc
+  err_file=$(mktemp)
+  OCI_OUT=$("$OCI" --no-retry "$@" 2>"$err_file")
+  rc=$?
+  OCI_ERR=$(cat "$err_file")
+  rm -f "$err_file"
+  return "$rc"
+}
 
 # ---------------------------------------------------------------------------
 # Classify an OCI error. Order matters: "Out of host capacity" is delivered as
@@ -65,18 +82,19 @@ classify() {
 # kept launching more instances -- straight past the free tier into billing.
 # ---------------------------------------------------------------------------
 log "Checking what this compartment already holds..."
-if ! EXISTING=$(ocic compute instance list \
+if ! ocic_capture compute instance list \
   --compartment-id "$COMPARTMENT" --all \
   --query "data[?\"shape\"=='$SHAPE' && \"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'].{n:\"display-name\",s:\"lifecycle-state\",o:\"shape-config\".ocpus}" \
-  --output json 2>&1); then
-  echo "$EXISTING" >&2
+  --output json; then
+  echo "$OCI_ERR" >&2
   fail "Could not list existing instances; refusing to launch blind."
 fi
+EXISTING=$OCI_OUT
 
 USED=$(printf '%s' "$EXISTING" | python3 -c '
 import sys, json
 try:
-    rows = json.loads(sys.stdin.read() or "[]") or []
+    rows = json.loads(sys.stdin.read().strip() or "[]") or []
 except Exception:
     sys.exit(9)
 print(int(sum(float(r.get("o") or 0) for r in rows)))
@@ -84,7 +102,7 @@ print(int(sum(float(r.get("o") or 0) for r in rows)))
 
 printf '%s' "$EXISTING" | python3 -c '
 import sys, json
-for r in json.loads(sys.stdin.read() or "[]") or []:
+for r in json.loads(sys.stdin.read().strip() or "[]") or []:
     print(f"  - {r.get(\"n\")}: {r.get(\"s\")} ({r.get(\"o\")} OCPU)")
 ' 2>/dev/null
 
@@ -112,18 +130,19 @@ log "Sizes to try: ${LADDER[*]} OCPU."
 # The original only ever tried availability domain [0] and one fault domain,
 # throwing away most of the placements capacity can free up in.
 # ---------------------------------------------------------------------------
-IMAGE_ID=$(ocic compute image list \
+ocic_capture compute image list \
   --compartment-id "$COMPARTMENT" \
   --operating-system "$OS_NAME" \
   --operating-system-version "$OS_VERSION" \
   --shape "$SHAPE" \
   --sort-by TIMECREATED --sort-order DESC \
   --query "data[?contains(\"display-name\", 'aarch64') && !contains(\"display-name\", 'Minimal')].id | [0]" \
-  --raw-output 2>&1)
+  --raw-output
+IMAGE_ID=$(printf '%s' "$OCI_OUT" | tr -d '[:space:]')
 
 case "$IMAGE_ID" in
   ocid1.image.*) ;;
-  *) fail "No $OS_NAME $OS_VERSION aarch64 image found for $SHAPE. Response: ${IMAGE_ID:-<empty>}" ;;
+  *) fail "No $OS_NAME $OS_VERSION aarch64 image found for $SHAPE. Response: ${OCI_ERR:-${OCI_OUT:-<empty>}}" ;;
 esac
 log "Image: $IMAGE_ID"
 
@@ -198,11 +217,12 @@ while [ "$SECONDS" -lt "$DEADLINE" ]; do
   [ -n "$fd" ] && args+=(--fault-domain "$fd")
 
   log "Attempt #$ATTEMPT: ${ocpus} OCPU / ${mem} GB in $ad${fd:+ / $fd}"
-  RESPONSE=$(ocic "${args[@]}" 2>&1)
+  ocic_capture "${args[@]}"
   RC=$?
+  RESPONSE=${OCI_ERR:-$OCI_OUT}
 
   if [ "$RC" -eq 0 ]; then
-    INSTANCE_ID=$(printf '%s' "$RESPONSE" | python3 -c \
+    INSTANCE_ID=$(printf '%s' "$OCI_OUT" | python3 -c \
       'import sys,json; print((json.load(sys.stdin).get("data") or {}).get("id",""))' 2>/dev/null)
     if [ -n "$INSTANCE_ID" ]; then
       log "GOT ONE. Instance $INSTANCE_ID (${ocpus} OCPU / ${mem} GB, $ad${fd:+ / $fd})"
@@ -215,7 +235,7 @@ while [ "$SECONDS" -lt "$DEADLINE" ]; do
       IP=""
       for _ in $(seq 1 20); do
         IP=$(ocic compute instance list-vnics --instance-id "$INSTANCE_ID" \
-              --query 'data[0]."public-ip"' --raw-output 2>/dev/null)
+              --query 'data[0]."public-ip"' --raw-output 2>/dev/null | tr -d '[:space:]')
         [ -n "$IP" ] && [ "$IP" != "null" ] && break
         IP=""
         sleep 6
