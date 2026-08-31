@@ -29,6 +29,7 @@ run_hunt() {
       MOCK_STATE_DIR="$RUN_DIR/state" \
       OCI_COMPARTMENT_OCID=ocid1.compartment.oc1..test \
       OCI_SUBNET_OCID=ocid1.subnet.oc1..test \
+      OCI_TENANCY_OCID=ocid1.tenancy.oc1..test \
       GITHUB_OUTPUT="$RUN_DIR/out" \
       GITHUB_STEP_SUMMARY="$RUN_DIR/summary" \
       HUNT_SECONDS=3 INTERVAL=1 JITTER=0 \
@@ -110,13 +111,52 @@ else
   bad "fails fast on NotAuthenticated instead of retrying for the whole window" "$LOG"
 fi
 
-# --- 8. Service limits stop immediately ------------------------------------
-run_hunt quota MOCK_SUCCEED_ON=999 \
-  MOCK_LAUNCH_ERROR='ServiceError: {"code": "LimitExceeded", "message": "The following service limits were exceeded: standard-a1-core-count", "status": 400}'
-if [ "$RC" -ne 0 ] && grep -q 'limit/quota problem' <<< "$LOG"; then
-  ok "fails fast on LimitExceeded"
+# --- 8. LimitExceeded on a big size steps down instead of giving up -------
+# The live tenancy refused 4 OCPU / 24 GB on standard-a1-mem. Quitting there
+# would never have tried the 1 OCPU that the same limit allows.
+run_hunt quota_stepdown MOCK_SUCCEED_ON=999 MOCK_LIMIT_MAX_OCPUS=1 HUNT_SECONDS=20 INTERVAL=1 JITTER=0
+if grep -q 'exceeds the A1 service limit. Dropping to sizes 2 1' <<< "$LOG" \
+   && grep -q 'Dropping to sizes 1 OCPU' <<< "$LOG" \
+   && grep -q '"ocpus": 1' "$TMP/quota_stepdown/state/launches"; then
+  ok "steps the ladder down on LimitExceeded instead of quitting"
 else
-  bad "fails fast on LimitExceeded" "$LOG"
+  bad "steps the ladder down on LimitExceeded instead of quitting" "$LOG"
+fi
+
+# --- 8b. A size the limit allows still wins after the step-down -----------
+run_hunt quota_then_win MOCK_SUCCEED_ON=3 MOCK_LIMIT_MAX_OCPUS=1 HUNT_SECONDS=20 INTERVAL=1 JITTER=0
+if [ "$RC" -eq 0 ] && grep -q 'result=launched' <<< "$OUT" && grep -q 'ocpus=1' <<< "$OUT"; then
+  ok "still captures a 1 OCPU instance after stepping past the limit"
+else
+  bad "still captures a 1 OCPU instance after stepping past the limit" "$OUT
+$LOG"
+fi
+
+# --- 8c. A limit that forbids every size is genuinely fatal ---------------
+run_hunt quota_all MOCK_SUCCEED_ON=999 MOCK_LIMIT_MAX_OCPUS=0 HUNT_SECONDS=20 INTERVAL=1 JITTER=0
+if [ "$RC" -ne 0 ] && grep -q 'Even the smallest size' <<< "$LOG"; then
+  ok "fails when even the smallest size exceeds the limit"
+else
+  bad "fails when even the smallest size exceeds the limit" "$LOG"
+fi
+
+# --- 8d. A zero service limit is caught before any launch ----------------
+run_hunt zero_limit MOCK_CORE_LIMIT=0 MOCK_MEM_LIMIT=0
+if [ "$RC" -ne 0 ] && grep -q 'allowed 0 A1 capacity' <<< "$LOG" \
+   && [ ! -f "$TMP/zero_limit/state/launches" ]; then
+  ok "refuses to launch at all when the tenancy A1 limit is zero"
+else
+  bad "refuses to launch at all when the tenancy A1 limit is zero" "$LOG"
+fi
+
+# --- 8e. Limits clamp the ladder before the first attempt ----------------
+run_hunt clamp MOCK_SUCCEED_ON=999 MOCK_CORE_LIMIT=2 MOCK_MEM_LIMIT=12
+if grep -q 'Tenancy A1 service limits: 2 OCPU / 12 GB' <<< "$LOG" \
+   && grep -q 'Sizes to try: 2 1 OCPU' <<< "$LOG" \
+   && ! grep -q '"ocpus": 4' "$TMP/clamp/state/launches"; then
+  ok "clamps the ladder to the service limits before attempting"
+else
+  bad "clamps the ladder to the service limits before attempting" "$LOG"
 fi
 
 # --- 9. Throttling backs off instead of hammering -------------------------

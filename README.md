@@ -29,11 +29,15 @@ Each run:
 3. **Rotates placements.** Every availability domain and every fault domain, in
    turn, largest size first at each one. Capacity frees up per host pool, so a
    miss in one fault domain says nothing about the next.
-4. **Reads the error before reacting.** `Out of host capacity` means rotate and
-   retry. `TooManyRequests` means back off exponentially. `NotAuthenticated` or
-   `LimitExceeded` mean stop — no amount of retrying fixes a wrong fingerprint
-   or an exhausted service limit.
-5. **Exits green when it simply did not win.** No capacity is the normal
+4. **Fits the request to the tenancy's service limits.** The A1 limits are read
+   up front and the ladder is clamped to them, so it never spends attempts
+   asking for more than the tenancy is allowed.
+5. **Reads the error before reacting.** `Out of host capacity` means rotate and
+   retry. `TooManyRequests` means back off exponentially. `NotAuthenticated`
+   means stop — no retry fixes a wrong fingerprint. `LimitExceeded` means this
+   *size* is too big, so the ladder drops a rung and keeps hunting; it is only
+   fatal once even the smallest size is refused.
+6. **Exits green when it simply did not win.** No capacity is the normal
    outcome, not a failure; failing the job on it would bury the real errors and
    fill your inbox.
 
@@ -103,13 +107,14 @@ Set these as `env:` on the *Hunt* step:
 ## Tests
 
 ```
-bash tests/test_hunt.sh      # 11 cases against tests/mock_oci.sh, no tenancy needed
+bash tests/test_hunt.sh      # 15 cases against tests/mock_oci.sh, no tenancy needed
 shellcheck -x scripts/*.sh tests/*.sh
 actionlint                   # workflow syntax; plain YAML parsing misses this
 ```
 
-The mock lets the failure paths that matter — the free-tier guard, the
-capacity/throttle/auth/quota classifier, placement rotation — be exercised
+The mock lets the failure paths that matter — the free-tier guard, service
+limit clamping and step-down, the capacity/throttle/auth classifier, placement
+rotation, and stdout/stderr separation — be exercised
 without waiting on real capacity. CI runs both on every push.
 
 ## When you win

@@ -117,6 +117,45 @@ if [ "$REMAINING" -le 0 ]; then
   exit 0
 fi
 
+# Service limits. Asking for more than the tenancy is allowed comes back as
+# LimitExceeded, so read the limits and shrink the request to fit rather than
+# spending attempts discovering it. Limits live on the tenancy (root
+# compartment), which may not be the compartment we launch into.
+TENANCY=$(printf '%s' "${OCI_TENANCY_OCID:-}" | tr -d ' \r\n\t"')
+if [ -z "$TENANCY" ]; then
+  TENANCY=$(awk -F= '/^[[:space:]]*tenancy[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2}' \
+    "${OCI_CLI_CONFIG_FILE:-$HOME/.oci/config}" 2>/dev/null)
+fi
+
+read_limit() {
+  ocic_capture limits value list -c "$1" --service-name compute --name "$2" --all \
+    --query 'max(data[].value)' --raw-output || return 1
+  printf '%s' "$OCI_OUT" | tr -cd '0-9'
+}
+
+if [ -n "$TENANCY" ]; then
+  CORE_LIMIT=$(read_limit "$TENANCY" standard-a1-core-count)
+  MEM_LIMIT=$(read_limit "$TENANCY" standard-a1-memory-count)
+else
+  CORE_LIMIT=""; MEM_LIMIT=""
+fi
+
+if [ -n "$CORE_LIMIT" ] && [ -n "$MEM_LIMIT" ]; then
+  log "Tenancy A1 service limits: ${CORE_LIMIT} OCPU / ${MEM_LIMIT} GB."
+  if [ "$CORE_LIMIT" -eq 0 ] || [ "$MEM_LIMIT" -eq 0 ]; then
+    summary "### Ampere A1 hunt stopped — no A1 quota"
+    summary "This tenancy's A1 service limit is ${CORE_LIMIT} OCPU / ${MEM_LIMIT} GB, so no A1 instance of any size can be launched."
+    summary "Raise it under Governance & Administration -> Limits, Quotas and Usage -> Compute -> standard-a1-core-count (Request a service limit increase)."
+    fail "This tenancy is allowed 0 A1 capacity (limits: ${CORE_LIMIT} OCPU / ${MEM_LIMIT} GB). Request a service limit increase before hunting."
+  fi
+  MEM_CAP=$(( MEM_LIMIT / GB_PER_OCPU ))
+  [ "$CORE_LIMIT" -lt "$REMAINING" ] && REMAINING=$CORE_LIMIT
+  [ "$MEM_CAP" -lt "$REMAINING" ] && REMAINING=$MEM_CAP
+  log "Largest size the limits and free allowance permit: ${REMAINING} OCPU."
+else
+  log "Could not read the A1 service limits; keeping the full ladder."
+fi
+
 # Only ladder rungs that still fit in the remaining free allowance.
 LADDER=()
 for n in $OCPU_LADDER; do
@@ -169,11 +208,16 @@ log "Placements to rotate through: ${#PLACEMENTS[@]}"
 
 # Flat attempt list: every placement, largest size first at each one.
 ATTEMPTS=()
-for p in "${PLACEMENTS[@]}"; do
-  for n in "${LADDER[@]}"; do
-    ATTEMPTS+=("$n|$p")
+build_attempts() {
+  ATTEMPTS=()
+  local p n
+  for p in "${PLACEMENTS[@]}"; do
+    for n in "${LADDER[@]}"; do
+      ATTEMPTS+=("$n|$p")
+    done
   done
-done
+}
+build_attempts
 
 [ -r "$SSH_KEY_FILE" ] || fail "SSH public key file '$SSH_KEY_FILE' is missing."
 if command -v ssh-keygen >/dev/null 2>&1; then
@@ -258,7 +302,7 @@ while [ "$SECONDS" -lt "$DEADLINE" ]; do
   fi
 
   KIND=$(classify "$RESPONSE")
-  FIRST_LINE=$(printf '%s' "$RESPONSE" | tr '\n' ' ' | cut -c1-300)
+  FIRST_LINE=$(printf '%s' "$RESPONSE" | tr '\n' ' ' | tr -s ' ' | cut -c1-500)
 
   case "$KIND" in
     capacity)
@@ -274,11 +318,26 @@ while [ "$SECONDS" -lt "$DEADLINE" ]; do
       log "Transient OCI error, retrying: $FIRST_LINE"
       ;;
     quota)
-      summary "### Ampere A1 hunt stopped — service limit"
-      summary "\`\`\`"
-      summary "$FIRST_LINE"
-      summary "\`\`\`"
-      fail "OCI reports a limit/quota problem, which retrying cannot fix: $FIRST_LINE"
+      # This size is over the tenancy's limit, but a smaller rung may still
+      # fit, so drop this size and anything larger and keep hunting. Only when
+      # nothing is left is the limit genuinely the end of the road.
+      NEW_LADDER=()
+      for n in "${LADDER[@]}"; do
+        [ "$n" -lt "$ocpus" ] && NEW_LADDER+=("$n")
+      done
+      if [ ${#NEW_LADDER[@]} -eq 0 ]; then
+        summary "### Ampere A1 hunt stopped — service limit"
+        summary "Even ${ocpus} OCPU / ${mem} GB exceeds this tenancy's A1 limit."
+        summary "\`\`\`"
+        summary "$FIRST_LINE"
+        summary "\`\`\`"
+        summary "Raise it under Governance & Administration -> Limits, Quotas and Usage -> Compute."
+        fail "Even the smallest size (${ocpus} OCPU / ${mem} GB) exceeds this tenancy's A1 service limit: $FIRST_LINE"
+      fi
+      LADDER=("${NEW_LADDER[@]}")
+      log "${ocpus} OCPU exceeds the A1 service limit. Dropping to sizes ${LADDER[*]} OCPU."
+      build_attempts
+      BACKOFF=5
       ;;
     auth|badrequest)
       summary "### Ampere A1 hunt stopped — configuration error"

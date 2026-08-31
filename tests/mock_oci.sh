@@ -30,10 +30,28 @@ case "$ARGS" in
   *"iam fault-domain list"*)
     echo "${MOCK_FDS:-[\"FAULT-DOMAIN-1\",\"FAULT-DOMAIN-2\"]}"; exit 0 ;;
 
+  *"limits value list"*)
+    case "$ARGS" in
+      *standard-a1-core-count*)   echo "${MOCK_CORE_LIMIT-4}" ;;
+      *standard-a1-memory-count*) echo "${MOCK_MEM_LIMIT-24}" ;;
+      *) echo "" ;;
+    esac
+    exit 0 ;;
+
   *"compute instance launch"*)
     n=$(( $(cat "$STATE/n" 2>/dev/null || echo 0) + 1 ))
     echo "$n" > "$STATE/n"
     printf '%s\n' "$ARGS" >> "$STATE/launches"
+
+    # Refuse anything above MOCK_LIMIT_MAX_OCPUS the way OCI refuses a request
+    # over the tenancy's service limit.
+    if [ -n "${MOCK_LIMIT_MAX_OCPUS:-}" ]; then
+      req=$(printf '%s' "$ARGS" | grep -oE '"ocpus": [0-9]+' | grep -oE '[0-9]+')
+      if [ "${req:-0}" -gt "$MOCK_LIMIT_MAX_OCPUS" ]; then
+        echo 'ServiceError: {"code": "LimitExceeded", "message": "The following service limits were exceeded: standard-a1-memory-count", "status": 400}' >&2
+        exit 1
+      fi
+    fi
     if [ -n "${MOCK_SUCCEED_ON:-}" ] && [ "$n" -ge "$MOCK_SUCCEED_ON" ]; then
       echo '{"data": {"id": "ocid1.instance.oc1.eu-madrid-1.WON", "lifecycle-state": "PROVISIONING"}}'
       exit 0

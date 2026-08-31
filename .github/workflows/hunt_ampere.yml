@@ -75,6 +75,9 @@ jobs:
         env:
           OCI_COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
           OCI_SUBNET_OCID: ${{ secrets.OCI_SUBNET_OCID }}
+          # Service limits live on the tenancy, which may not be the
+          # compartment the instance is launched into.
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
           OCPU_LADDER: ${{ github.event.inputs.ocpu_ladder || '4 2 1' }}
           DISPLAY_NAME: ${{ github.event.inputs.display_name || 'ObliskIQ-lite' }}
           DURATION_MINUTES: ${{ github.event.inputs.duration_minutes || '10' }}
