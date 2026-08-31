@@ -2,7 +2,7 @@ name: Hunt Oracle Ampere A1
 
 on:
   schedule:
-    # GitHub ejecuta el workflow cada 5 minutos (mínimo de la plataforma)
+    # Ejecuta el flujo cada 5 minutos
     - cron: '*/5 * * * *'
   workflow_dispatch:
 
@@ -12,22 +12,28 @@ jobs:
 
     steps:
       - name: Setup OCI CLI & Config
+        env:
+          OCI_KEY_RAW: ${{ secrets.OCI_API_KEY }}
         run: |
           pip install --no-cache-dir oci-cli
 
-          mkdir -p ~/.oci
-          echo "${{ secrets.OCI_API_KEY }}" > ~/.oci/oci_api_key.pem
-          chmod 600 ~/.oci/oci_api_key.pem
+          # 1. Crear carpeta de configuración
+          mkdir -p "$HOME/.oci"
 
-          cat <<EOF > ~/.oci/config
+          # 2. Volcar la clave respetando saltos de línea exactos
+          printf "%s\n" "$OCI_KEY_RAW" > "$HOME/.oci/oci_api_key.pem"
+          chmod 600 "$HOME/.oci/oci_api_key.pem"
+
+          # 3. Crear archivo de configuración con ruta absoluta
+          cat <<EOF > "$HOME/.oci/config"
           [DEFAULT]
           user=${{ secrets.OCI_USER_OCID }}
           fingerprint=${{ secrets.OCI_FINGERPRINT }}
           tenancy=${{ secrets.OCI_TENANCY_OCID }}
           region=${{ secrets.OCI_REGION }}
-          key_file=~/.oci/oci_api_key.pem
+          key_file=$HOME/.oci/oci_api_key.pem
           EOF
-          chmod 600 ~/.oci/config
+          chmod 600 "$HOME/.oci/config
 
       - name: Fetch Availability Domain & Ubuntu ARM Image
         id: fetch-resources
@@ -47,8 +53,10 @@ jobs:
           echo "IMAGE_ID=$IMAGE_ID" >> $GITHUB_OUTPUT
 
       - name: Hunt Loop (Every 15 seconds)
+        env:
+          SSH_KEY_RAW: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
-          echo "${{ secrets.SSH_PUBLIC_KEY }}" > ssh_key.pub
+          printf "%s\n" "$SSH_KEY_RAW" > ssh_key.pub
 
           # El bucle dura 240 segundos (4 minutos) reintentando cada 15s
           END_TIME=$((SECONDS + 240))
