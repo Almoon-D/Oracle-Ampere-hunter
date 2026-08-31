@@ -62,6 +62,16 @@ fi
 log "Fingerprint matches the private key (${DERIVED_FP:0:5}...${DERIVED_FP: -5})."
 
 # --- 4. Sanity-check the OCIDs ------------------------------------------
+# Enough of each OCID to compare against the console, never the whole value.
+# The full string is a repository secret and would be masked in the log; a
+# substring is not, and the length exposes a truncated paste.
+ocid_hint() {
+  local v="$1"
+  local n=${#v}
+  if [ "$n" -le 24 ]; then printf '%s (length %d - suspiciously short)' "$v" "$n"
+  else printf '%s...%s (length %d)' "${v:0:20}" "${v: -6}" "$n"; fi
+}
+
 USER_CLEAN=$(printf '%s' "$OCI_USER_OCID" | tr -d ' \r\n\t"')
 TENANCY_CLEAN=$(printf '%s' "$OCI_TENANCY_OCID" | tr -d ' \r\n\t"')
 REGION_CLEAN=$(printf '%s' "$OCI_REGION" | tr -d ' \r\n\t"')
@@ -69,6 +79,9 @@ REGION_CLEAN=$(printf '%s' "$OCI_REGION" | tr -d ' \r\n\t"')
 case "$USER_CLEAN" in ocid1.user.*) ;; *) die "OCI_USER_OCID must start with 'ocid1.user.' (got '${USER_CLEAN:0:24}...')." ;; esac
 case "$TENANCY_CLEAN" in ocid1.tenancy.*) ;; *) die "OCI_TENANCY_OCID must start with 'ocid1.tenancy.' (got '${TENANCY_CLEAN:0:24}...')." ;; esac
 [ -n "$REGION_CLEAN" ] || die "OCI_REGION is empty (e.g. eu-madrid-1)."
+
+log "User OCID:    $(ocid_hint "$USER_CLEAN")"
+log "Tenancy OCID: $(ocid_hint "$TENANCY_CLEAN")"
 
 # --- 5. Write the config -------------------------------------------------
 cat > "$CFG_FILE" <<EOF
@@ -99,19 +112,21 @@ if ! OUT=$(oci iam region-subscription list --config-file "$CFG_FILE" --no-retry
     # console can say which.
     cat >&2 <<'HINT'
 The key and fingerprint are internally consistent, so the remaining causes are
-all about what Oracle has on record. In the OCI console, open
-  Profile (top right) -> My profile -> API keys
-and check, in order:
+all about what Oracle has on record. Compare the values printed above against
+the OCI console:
 
-  1. Is a key listed with the fingerprint shown above? If not, the public half
-     was never uploaded. Add it: "Add API key" -> "Paste a public key", pasting
-     the .pub/PEM public key that pairs with OCI_API_KEY.
-  2. Are you looking at the same user as OCI_USER_OCID? Copy the OCID from
-     "My profile" and compare it with the secret. A key uploaded to one user
-     will not authenticate another.
-  3. Is OCI_TENANCY_OCID the tenancy that user lives in? Profile -> Tenancy.
-     If the tenancy uses Identity Domains, the user must be the domain user
-     that owns the key.
+  1. Fingerprint -- Profile (top right) -> My profile -> API keys.
+     If no key with that fingerprint is listed, the public half was never
+     uploaded: "Add API key" -> "Paste a public key", pasting the public key
+     that pairs with OCI_API_KEY.
+  2. User OCID -- My profile -> OCID (use the Copy link, do not retype).
+     A key uploaded to one user will not authenticate another, and this is the
+     usual culprit once the fingerprint checks out.
+  3. Tenancy OCID -- Profile -> Tenancy: <name> -> OCID.
+     With Identity Domains, the user must be the domain user owning the key.
+
+If either length above looks short, the secret was truncated on paste; OCIDs
+run to roughly 80-100 characters. Re-copy it with the console's Copy link.
 
 To recompute the fingerprint from your private key locally:
   openssl rsa -pubout -outform DER -in your_key.pem | openssl md5 -c
